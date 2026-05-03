@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -6,13 +7,14 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
 use eframe::CreationContext;
 
 use crate::audio::decoder;
+use crate::engine::{Command, Engine};
 use crate::track::Track;
-use crate::ui::menu;
+use crate::ui::{menu, transport};
 
 enum LoadStatus {
     Idle,
     Loading(PathBuf),
-    Loaded { path: PathBuf, track: Track },
+    Loaded { path: PathBuf, track: Arc<Track> },
     Failed { path: PathBuf, error: String },
 }
 
@@ -25,15 +27,24 @@ pub struct App {
     status: LoadStatus,
     load_tx: Sender<LoadResult>,
     load_rx: Receiver<LoadResult>,
+    engine: Option<Engine>,
 }
 
 impl App {
     pub fn new(_cc: &CreationContext<'_>) -> Self {
         let (load_tx, load_rx) = unbounded();
+        let engine = match Engine::spawn() {
+            Ok(e) => Some(e),
+            Err(e) => {
+                log::error!("failed to spawn audio engine: {e:#}");
+                None
+            }
+        };
         Self {
             status: LoadStatus::Idle,
             load_tx,
             load_rx,
+            engine,
         }
     }
 
@@ -67,6 +78,10 @@ impl App {
                                 track.channels,
                                 track.frame_count()
                             );
+                            let track = Arc::new(track);
+                            if let Some(engine) = &self.engine {
+                                engine.send(Command::LoadTrack(track.clone()));
+                            }
                             LoadStatus::Loaded { path, track }
                         }
                         Err(e) => {
@@ -88,9 +103,16 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_decode_results();
 
-        // Keep repainting while a decode is in flight so the spinner animates.
-        if matches!(self.status, LoadStatus::Loading(_)) {
-            ctx.request_repaint_after(Duration::from_millis(100));
+        // Repaint while decoding (spinner) or while a track is loaded (so the
+        // playhead/seek slider update during playback).
+        match self.status {
+            LoadStatus::Loading(_) => {
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
+            LoadStatus::Loaded { .. } => {
+                ctx.request_repaint_after(Duration::from_millis(33));
+            }
+            _ => {}
         }
 
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
@@ -120,15 +142,21 @@ impl eframe::App for App {
                 }
                 LoadStatus::Loaded { path, track } => {
                     ui.label(format!("File: {}", path.display()));
-                    ui.label(format!("Sample rate: {} Hz", track.sample_rate));
-                    ui.label(format!("Channels: {}", track.channels));
-                    let frames = track.frame_count();
-                    let secs = frames as f64 / track.sample_rate as f64;
                     ui.label(format!(
-                        "Duration: {} ({} frames)",
-                        format_duration(secs),
-                        frames
+                        "{} Hz · {} ch · {} frames",
+                        track.sample_rate,
+                        track.channels,
+                        track.frame_count()
                     ));
+                    ui.add_space(8.0);
+                    if let Some(engine) = &self.engine {
+                        transport::show(ui, engine, track.sample_rate, track.frame_count());
+                    } else {
+                        ui.colored_label(
+                            egui::Color32::LIGHT_RED,
+                            "Audio engine failed to start — check the log.",
+                        );
+                    }
                 }
                 LoadStatus::Failed { path, error } => {
                     ui.colored_label(egui::Color32::LIGHT_RED, "Failed to load file");
@@ -137,18 +165,5 @@ impl eframe::App for App {
                 }
             }
         });
-    }
-}
-
-fn format_duration(secs: f64) -> String {
-    let total = secs.max(0.0) as u64;
-    let h = total / 3600;
-    let m = (total % 3600) / 60;
-    let s = total % 60;
-    let ms = ((secs - total as f64) * 1000.0).round() as u32;
-    if h > 0 {
-        format!("{h}:{m:02}:{s:02}.{ms:03}")
-    } else {
-        format!("{m}:{s:02}.{ms:03}")
     }
 }

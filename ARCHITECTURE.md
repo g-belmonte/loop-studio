@@ -38,12 +38,12 @@ This document describes how Loop Studio is wired together. It is a living docume
 - Maintains the playback cursor and applies loop wrap-around at the source.
 - Pre-computes a downsampled **peaks array** when a track loads (one min/max pair per N source frames) and shares it with the GUI via `Arc<TrackPeaks>`.
 
-> **Status:** the engine thread does not exist yet. v0.1 step 1 (file open) decodes on a one-shot `std::thread` spawned from the GUI and stores the resulting `Track` in `App`. Ownership moves to the engine in step 2 when the cpal output path lands.
+> **Status:** engine thread is up (v0.1 step 2). It owns the cpal output stream, the ring producer, the cursor, and a `Box<dyn TimePitchProcessor>` (currently `Passthrough`). It does **not** own decoding — files are still decoded on a one-shot `std::thread` spawned from the GUI and handed to the engine via `Command::LoadTrack(Arc<Track>)`. Decoding may move into the engine later if streamed decode replaces whole-file decode.
 
 ### Audio callback (`cpal`)
 - The only thread that touches the OS audio device.
 - Pops samples from the ring buffer; writes to the output buffer.
-- Underrun handling: emit silence + set an atomic flag the engine watches.
+- Underrun handling: fill the unfilled tail of the output buffer with zeros (silence). No flag yet — adding one when something needs to react.
 - **No allocation, no syscalls, no `.lock()`** in this callback — ever.
 
 ## Data flow for one playback frame
@@ -166,8 +166,14 @@ Versioned from day one so we can migrate without breaking saved sessions.
 ## Decisions
 
 - **Decode strategy = whole-file** (decided v0.1 step 1). `audio::decoder::decode_file` reads the entire file into a `Track { samples: Vec<f32>, ... }` of interleaved f32. Cost: ~1.3 GB RAM for a 1-hour 44.1 kHz stereo track. Acceptable for a practice tool that mostly chews on 3–8 minute songs. Revisit if real-world use surfaces long-form pain (audiobooks, full concerts).
+- **Output stream rate = track rate when supported, device default otherwise** (decided v0.1 step 2). `audio::output::open` first tries to build an F32 stream at the track's exact rate and channel count; if that fails it falls back to `default_output_config()` and logs a warning that playback rate will be wrong. Resampling for mismatched rates lands naturally with the rubato stage in step 4. The stream is reopened on every `LoadTrack` whose rate or channel count differs from the current stream.
+
+  We deliberately do **not** call `device.supported_output_configs()`. On Linux with pipewire-alsa it errors out during the probe ("device no longer available") even though `build_output_stream` against the same device works fine. Try-then-fall-back is more robust than enumerate-then-build on every backend we've encountered.
+- **Ring buffer size = 8192 interleaved samples** (decided v0.1 step 2). About 85 ms at 48 kHz stereo. Small enough that post-seek lag is unnoticeable without flushing the ring; large enough to absorb GUI/decoder hiccups. The engine wakes every 2 ms to refill it. Revisit if underruns appear.
+- **Channels must match track ↔ output** (decided v0.1 step 2). Mono-on-stereo upmixing and arbitrary downmixing are deferred. If the device has no config matching the track's channel count, `output::open` falls back to the default and logs a warning; the resulting layout mismatch will sound wrong. Address this if a real file in real use trips it.
 
 ## Open questions
 
+- **Ring flush on seek**: ringbuf has no producer-side flush, so after a `Seek` the ~85 ms of audio already in the ring still plays before the new position is heard. Acceptable today but if it becomes annoying we'll need an epoch protocol (callback drops samples it sees as stale) or a stream-restart trick. For now, keep the ring small.
+- **Seek-while-playing slider jitter**: the seek slider re-binds to the engine's `position` every frame, so dragging while playing produces visible micro-stepping (pointer says X, next frame engine says X+Δ). Plan: when the slider response reports `dragged()`, freeze the displayed value to the user's pointer until release. Cheap fix, deferred to v0.2.
 - **Phase vocoder crate**: survey current ecosystem at the start of Phase 4. Candidates: `phase-vocoder`, `signalsmith-stretch` bindings (if they exist), or roll our own.
-- **Backpressure**: how big is the ring buffer? Start with 200 ms at 48 kHz stereo; tune once we observe underruns.
