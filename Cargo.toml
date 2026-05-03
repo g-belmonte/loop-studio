@@ -1,0 +1,41 @@
+[package]
+name = "loop-studio"
+version = "0.1.0"
+edition = "2024"
+description = "A practice-focused music player with loop points, speed control, and pitch shift"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# GUI
+eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = "0.29"
+
+# Audio I/O & decoding
+cpal = "0.15"
+symphonia = { version = "0.5", features = ["mp3", "flac", "vorbis", "wav", "aac", "isomp4"] }
+
+# DSP building blocks (resampling; time-stretch/pitch-shift impl TBD — see ARCHITECTURE.md)
+rubato = "0.16"
+
+# Lock-free SPSC ring buffer between DSP and audio callback
+ringbuf = "0.4"
+
+# Cross-thread command channel (GUI -> engine)
+crossbeam-channel = "0.5"
+
+# Session persistence
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Native file dialogs
+rfd = "0.15"
+
+# Error handling & logging
+anyhow = "1"
+thiserror = "2"
+log = "0.4"
+env_logger = "0.11"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
