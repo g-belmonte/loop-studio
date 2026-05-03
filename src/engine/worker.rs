@@ -137,12 +137,18 @@ fn apply(
         }
         Command::Seek(pos) => {
             if let Some(t) = track.as_ref() {
-                *cursor = pos.min(t.frame_count());
+                let target = pos.min(t.frame_count());
+                *cursor = snap_into_loop(target, *loop_region);
                 state.position.store(*cursor, Ordering::Relaxed);
             }
         }
         Command::SetLoop(region) => {
             *loop_region = region;
+            let snapped = snap_into_loop(*cursor, *loop_region);
+            if snapped != *cursor {
+                *cursor = snapped;
+                state.position.store(*cursor, Ordering::Relaxed);
+            }
         }
         Command::SetSpeed(speed) => {
             dsp.set_speed(speed);
@@ -171,9 +177,12 @@ fn produce(
     let channels = track.channels as usize;
     let total_frames = track.frame_count();
 
-    // Loop wrap if cursor is at or past loop end (covers seek-into-no-mans-land).
+    // Defence in depth: keep the cursor inside the loop on every tick. The
+    // command handlers above already snap on Seek/SetLoop, but this catches
+    // anything that slips through (e.g. a future code path that mutates the
+    // cursor without going through a Command).
     if let Some(l) = loop_region {
-        if *cursor >= l.end {
+        if *cursor >= l.end || *cursor < l.start {
             *cursor = l.start;
         }
     }
@@ -212,4 +221,15 @@ fn produce(
     let pushed_frames = (pushed_samples / channels) as u64;
     *cursor += pushed_frames;
     state.position.store(*cursor, Ordering::Relaxed);
+}
+
+/// Snap a cursor frame into a loop region. Cursors below `start` or at/past
+/// `end` are pulled to `start` (the only consistent landing spot for the
+/// "stay inside the loop" invariant). Returns the input unchanged if no loop
+/// is set or the region is degenerate.
+fn snap_into_loop(cursor: u64, loop_region: Option<LoopRegion>) -> u64 {
+    match loop_region {
+        Some(l) if l.end > l.start && (cursor < l.start || cursor >= l.end) => l.start,
+        _ => cursor,
+    }
 }

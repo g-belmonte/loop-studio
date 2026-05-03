@@ -9,8 +9,9 @@ use eframe::CreationContext;
 
 use crate::audio::decoder;
 use crate::engine::{Command, Engine};
-use crate::track::Track;
 use crate::track::peaks::TrackPeaks;
+use crate::track::{LoopRegion, Track};
+use crate::ui::waveform::WaveformAction;
 use crate::ui::{menu, transport, waveform};
 
 enum LoadStatus {
@@ -37,6 +38,7 @@ pub struct App {
     load_tx: Sender<LoadResult>,
     load_rx: Receiver<LoadResult>,
     engine: Option<Engine>,
+    loop_region: Option<LoopRegion>,
 }
 
 impl App {
@@ -54,6 +56,7 @@ impl App {
             load_tx,
             load_rx,
             engine,
+            loop_region: None,
         }
     }
 
@@ -91,6 +94,7 @@ impl App {
                                 track.frame_count(),
                                 peaks.len(),
                             );
+                            self.loop_region = None;
                             if let Some(engine) = &self.engine {
                                 engine.send(Command::LoadTrack(track.clone()));
                             }
@@ -164,11 +168,43 @@ impl eframe::App for App {
 
                     if let Some(engine) = &self.engine {
                         let position = engine.state().position.load(Ordering::Relaxed);
-                        if let Some(seek_to) =
-                            waveform::show(ui, peaks, position, track.frame_count(), 160.0)
-                        {
-                            engine.send(Command::Seek(seek_to));
+                        let action = waveform::show(
+                            ui,
+                            peaks,
+                            position,
+                            track.frame_count(),
+                            self.loop_region,
+                            160.0,
+                        );
+                        match action {
+                            WaveformAction::None => {}
+                            WaveformAction::Seek(frame) => {
+                                engine.send(Command::Seek(frame));
+                            }
+                            WaveformAction::SetLoop(region) => {
+                                self.loop_region = Some(region);
+                                engine.send(Command::SetLoop(Some(region)));
+                            }
                         }
+
+                        if let Some(r) = self.loop_region {
+                            ui.horizontal(|ui| {
+                                ui.label(format!(
+                                    "Loop: {} → {}  ({})",
+                                    transport::format_time(r.start, track.sample_rate),
+                                    transport::format_time(r.end, track.sample_rate),
+                                    transport::format_time(
+                                        r.end.saturating_sub(r.start),
+                                        track.sample_rate
+                                    ),
+                                ));
+                                if ui.button("Clear loop").clicked() {
+                                    self.loop_region = None;
+                                    engine.send(Command::SetLoop(None));
+                                }
+                            });
+                        }
+
                         ui.add_space(8.0);
                         transport::show(ui, engine, track.sample_rate, track.frame_count());
                     } else {

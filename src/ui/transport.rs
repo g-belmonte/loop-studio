@@ -42,7 +42,7 @@ pub fn show(ui: &mut egui::Ui, engine: &Engine, sample_rate: u32, total_frames: 
     dragging
 }
 
-fn format_time(frames: u64, sample_rate: u32) -> String {
+pub fn format_time(frames: u64, sample_rate: u32) -> String {
     if sample_rate == 0 {
         return "0:00.000".into();
     }
