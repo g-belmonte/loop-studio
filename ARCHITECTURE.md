@@ -33,10 +33,12 @@ This document describes how Loop Studio is wired together. It is a living docume
 - Owns no audio data directly — it asks the engine.
 
 ### Engine thread
-- Owns the decoder, the DSP stage, and the producer half of the ring buffer.
-- Pulls commands from the channel; pulls decoded frames from `symphonia`; pushes processed samples into the ring buffer.
+- Owns the DSP stage and the producer half of the ring buffer.
+- Pulls commands from the channel; reads source samples from the loaded `Track` (whole-file, decoded up front — see *Decode strategy* below); pushes processed samples into the ring buffer.
 - Maintains the playback cursor and applies loop wrap-around at the source.
 - Pre-computes a downsampled **peaks array** when a track loads (one min/max pair per N source frames) and shares it with the GUI via `Arc<TrackPeaks>`.
+
+> **Status:** the engine thread does not exist yet. v0.1 step 1 (file open) decodes on a one-shot `std::thread` spawned from the GUI and stores the resulting `Track` in `App`. Ownership moves to the engine in step 2 when the cpal output path lands.
 
 ### Audio callback (`cpal`)
 - The only thread that touches the OS audio device.
@@ -161,8 +163,11 @@ The `TimePitchProcessor` trait keeps the engine ignorant of which phase we're in
 
 Versioned from day one so we can migrate without breaking saved sessions.
 
+## Decisions
+
+- **Decode strategy = whole-file** (decided v0.1 step 1). `audio::decoder::decode_file` reads the entire file into a `Track { samples: Vec<f32>, ... }` of interleaved f32. Cost: ~1.3 GB RAM for a 1-hour 44.1 kHz stereo track. Acceptable for a practice tool that mostly chews on 3–8 minute songs. Revisit if real-world use surfaces long-form pain (audiobooks, full concerts).
+
 ## Open questions
 
-- **Decode strategy**: decode the whole file up front (simple, RAM-hungry on long tracks) vs. stream + cache decoded frames near the playhead (complex, scales). Start with whole-file; revisit if a 1-hour FLAC becomes a problem.
 - **Phase vocoder crate**: survey current ecosystem at the start of Phase 4. Candidates: `phase-vocoder`, `signalsmith-stretch` bindings (if they exist), or roll our own.
 - **Backpressure**: how big is the ring buffer? Start with 200 ms at 48 kHz stereo; tune once we observe underruns.
