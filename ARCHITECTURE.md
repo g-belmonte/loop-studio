@@ -130,8 +130,11 @@ pub struct SharedState {
 pub trait TimePitchProcessor: Send {
     fn set_speed(&mut self, speed: f32);
     fn set_pitch_semitones(&mut self, semitones: f32);
-    fn process(&mut self, input: &[f32], output: &mut [f32]) -> (usize, usize);
-    // returns (input consumed, output written)
+    /// Frames of input the DSP wants per process() call.
+    fn input_frames_per_chunk(&self) -> usize;
+    /// Upper bound on output frames per process() call across all settings.
+    fn max_output_frames_per_chunk(&self) -> usize;
+    fn process(&mut self, input: &[f32], output: &mut [f32], channels: usize) -> (usize, usize);
 }
 ```
 
@@ -139,8 +142,8 @@ pub trait TimePitchProcessor: Send {
 
 Independent time-stretch and pitch-shift is the hardest part of this project. We have a tiered plan:
 
-1. **Phase 1 — Passthrough** (`dsp/passthrough.rs`). Wire the engine end-to-end with no DSP. Confirms decode → ring buffer → callback works.
-2. **Phase 2 — Speed-coupled** (`dsp/resample.rs`). Use `rubato` to resample on the fly: changes speed *and* pitch together. Validates the resampler integration and the variable-rate consumer pattern.
+1. **Phase 1 — Passthrough** (`dsp/passthrough.rs`). ✅ Done. Wired the engine end-to-end with no DSP. Now serves as a fallback when the resampler can't be constructed.
+2. **Phase 2 — Speed-coupled** (`dsp/resample.rs`). ✅ Done in v0.1 step 5. `rubato::SincFixedIn`, chunk = 1024 frames, `max_resample_ratio_relative = 4.0`. Speed slider works; pitch is coupled to speed (turntable).
 3. **Phase 3 — WSOLA + resample** (`dsp/wsola.rs`). Implement WSOLA (Waveform-Similarity Overlap-Add) for time-stretch — ~200 lines, works in the time domain, low-latency. Cascade with `rubato` for pitch shift. This is the MVP target.
 4. **Phase 4 — Phase vocoder** (optional). If WSOLA quality isn't enough on harmonic material, add an FFT-based phase vocoder behind the same trait.
 5. **Phase 5 — FFI** (optional, license-permitting). Rubber Band or SoundTouch as opt-in features for top-tier quality.
@@ -173,10 +176,18 @@ Versioned from day one so we can migrate without breaking saved sessions.
 - **Output stream rate = track rate when supported, device default otherwise** (decided v0.1 step 2). `audio::output::open` first tries to build an F32 stream at the track's exact rate and channel count; if that fails it falls back to `default_output_config()` and logs a warning that playback rate will be wrong. Resampling for mismatched rates lands naturally with the rubato stage in step 4. The stream is reopened on every `LoadTrack` whose rate or channel count differs from the current stream.
 
   We deliberately do **not** call `device.supported_output_configs()`. On Linux with pipewire-alsa it errors out during the probe ("device no longer available") even though `build_output_stream` against the same device works fine. Try-then-fall-back is more robust than enumerate-then-build on every backend we've encountered.
-- **Ring buffer size = 8192 interleaved samples** (decided v0.1 step 2). About 85 ms at 48 kHz stereo. Small enough that post-seek lag is unnoticeable without flushing the ring; large enough to absorb GUI/decoder hiccups. The engine wakes every 2 ms to refill it. Revisit if underruns appear.
+- **Ring buffer size = 16384 interleaved samples** (decided v0.1 step 2, raised in step 5). About 170 ms at 48 kHz stereo. The original 8192 was right when the DSP was passthrough but became a deadlock once `ResampleSpeed` arrived: with `max_resample_ratio_relative = 4.0` and `chunk = 1024`, the resampler's worst-case output is 4096 frames = 8192 stereo samples, so an 8192-sample ring could only ever be refilled when fully empty. Doubling the ring gives the engine room to refill while the callback is still draining. The engine wakes every 2 ms.
 - **Channels must match track ↔ output** (decided v0.1 step 2). Mono-on-stereo upmixing and arbitrary downmixing are deferred. If the device has no config matching the track's channel count, `output::open` falls back to the default and logs a warning; the resulting layout mismatch will sound wrong. Address this if a real file in real use trips it.
 - **A/B loop interaction = drag to define, click to seek** (decided v0.1 step 4). On the waveform widget, a plain click seeks; a click-and-drag defines the loop region from press to release (auto-ordered so `start < end`). `drag_stopped` wins over `clicked` when both could fire. A "Clear loop" button appears below the waveform when a loop is active. Considered and rejected: modal "Set A / Set B" buttons (more clicks, hidden state) and modifier-clicks (poor discoverability). Keyboard shortcuts (`[`/`]`) are explicit v0.2 scope.
 - **Cursor stays inside the loop** (decided v0.1 step 4). When a loop is active and the cursor would otherwise sit outside it (after `SetLoop`, after `Seek`, or any future code path), the engine snaps it to `loop.start`. Implemented as `engine::worker::snap_into_loop`, called from the `SetLoop` and `Seek` command handlers and re-checked at the top of `produce()` as defence in depth. Rationale: the user's mental model when they create a loop is "this region, on repeat, starting now" — playing-in from outside the loop violates that. Side effect: clicking outside an active loop snaps the playhead to `loop.start` rather than where you clicked; clear the loop first if you want to seek out.
+- **Chunk-aware engine ↔ DSP contract** (decided v0.1 step 5). The DSP defines a fixed `input_frames_per_chunk()`, an upper bound `max_output_frames_per_chunk()`, and an `expected_output_frames_per_chunk()` that reflects the *current* ratio. `produce()` only calls `dsp.process()` once `in_chunk` source frames are available *and* the ring has `expected_output * channels` vacancy. Scratch is sized to the worst case (`max_output * channels`) so a mid-process ratio change can't overflow it; the vacancy check uses the expected output so the engine isn't over-conservative when the resampler is at unity. Cursor advances by the consumed input count, not the produced output. Chunk = 1024 frames (~23 ms at 44.1 kHz) for both passthrough and the rubato resampler.
+- **DSP recreated per `LoadTrack` when channel count changes** (decided v0.1 step 5). Rubato's `SincFixedIn` is constructed with a fixed channel count, so we can't reuse it across mono ↔ stereo loads. The engine builds a new `ResampleSpeed` (and resizes the scratch buffer) only when the channel count actually changes — same-channel reloads keep the existing DSP and the user's current speed setting. The current speed is also re-applied to the new DSP so the slider value carries over across track changes.
+- **End-of-track tail is dropped; loop boundaries are stitched** (decided v0.1 step 5). When fewer than `in_chunk` source frames remain before the boundary:
+  - **No loop active** → drop the last <23 ms, snap cursor to `total_frames`, the run loop's EOF check fires.
+  - **Loop active and `loop_length >= in_chunk`** → assemble the chunk's input from `cursor..loop.end` plus the head of `loop.start..` into a pre-allocated `stitch_buf`; advance the cursor to `loop.start + head_frames`. Loop wraps stay gap-free and the DSP still gets a clean fixed-size chunk.
+  - **Loop active and `loop_length < in_chunk`** → produce silence and bail. Sub-23-ms loops aren't supported in v0.1.
+
+  Without stitching, loop wrapping was broken whenever `loop_length` wasn't an exact multiple of `in_chunk`: the cursor stuck `loop_length % in_chunk` frames before `loop.end` and the snap-back at the top of `produce()` never fired. Pre-step-5 code didn't have this problem because it pushed any size, but the chunk-aware DSP can't.
 - **Loop state lives in `App`, not `SharedState`** (decided v0.1 step 4). The user creates loops in the UI, so `App` is the natural source of truth; `Command::SetLoop` is fire-and-forget to the engine. Adding loop atomics to `SharedState` would just create a second copy that's always one frame behind. Reconsider if anything other than the engine ever needs to *read* the engine's effective loop region.
 
 ## Open questions

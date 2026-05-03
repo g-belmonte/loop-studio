@@ -38,7 +38,7 @@ See [ARCHITECTURE.md](./ARCHITECTURE.md) for thread layout, data flow, and modul
 - [x] **Transport**: play / pause / stop / seek.
 - [x] **Waveform view** with playhead and click-to-seek.
 - [x] **A/B loop**: click waveform to set start/end; seamless loop playback.
-- [ ] **Speed slider** 0.25× – 2.0× (real-time).
+- [x] **Speed slider** 0.25× – 2.0× (real-time). Pitch-coupled until step 6 lands WSOLA.
 - [ ] **Pitch slider** ±12 semitones (real-time, independent of speed).
 - [ ] **Session save/load** (JSON: path, loop, speed, pitch, last position).
 

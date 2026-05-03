@@ -39,6 +39,26 @@ pub fn show(ui: &mut egui::Ui, engine: &Engine, sample_rate: u32, total_frames: 
     if response.changed() {
         engine.send(Command::Seek(pos));
     }
+
+    // Speed control. Logarithmic so 0.5× and 2× sit equidistant from 1×.
+    let mut speed = f32::from_bits(state.speed_bits.load(Ordering::Relaxed));
+    if !speed.is_finite() || speed <= 0.0 {
+        speed = 1.0;
+    }
+    ui.horizontal(|ui| {
+        let r = ui.add(
+            egui::Slider::new(&mut speed, 0.25..=2.0)
+                .logarithmic(true)
+                .text("speed ×"),
+        );
+        if r.changed() {
+            engine.send(Command::SetSpeed(speed));
+        }
+        if ui.button("1×").clicked() {
+            engine.send(Command::SetSpeed(1.0));
+        }
+    });
+
     dragging
 }
 

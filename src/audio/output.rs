@@ -8,9 +8,14 @@ use crate::audio::ring::{SampleConsumer, SampleProducer};
 
 /// Number of interleaved samples in the output ring buffer.
 ///
-/// 8192 samples = 4096 frames stereo ≈ 85 ms at 48 kHz. Small enough that
-/// post-seek lag is unnoticeable; large enough to absorb GUI-thread hiccups.
-const RING_BUFFER_SAMPLES: usize = 8192;
+/// 16384 samples = 8192 frames stereo ≈ 170 ms at 48 kHz. Sized to be at
+/// least 2× the worst-case `max_output_frames_per_chunk * channels` of any
+/// DSP we'd plug in — the rubato resampler with `max_resample_ratio_relative
+/// = 4.0` and chunk = 1024 frames pushes up to 4096 stereo frames per call,
+/// so a ring of just 8192 samples can only ever be refilled when fully
+/// empty. Keeping headroom here lets the engine refill while the callback
+/// is still draining, which is what avoids audible gaps.
+const RING_BUFFER_SAMPLES: usize = 16384;
 
 /// A live output stream + the producer half of its ring buffer.
 ///
