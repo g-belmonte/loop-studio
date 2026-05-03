@@ -36,7 +36,7 @@ See [ARCHITECTURE.md](./ARCHITECTURE.md) for thread layout, data flow, and modul
 
 - [x] **Open file** via dialog; decode in background.
 - [x] **Transport**: play / pause / stop / seek.
-- [ ] **Waveform view** with playhead and click-to-seek.
+- [x] **Waveform view** with playhead and click-to-seek.
 - [ ] **A/B loop**: click waveform to set start/end; seamless loop playback.
 - [ ] **Speed slider** 0.25× – 2.0× (real-time).
 - [ ] **Pitch slider** ±12 semitones (real-time, independent of speed).

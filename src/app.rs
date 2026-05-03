@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
 
@@ -9,18 +10,26 @@ use eframe::CreationContext;
 use crate::audio::decoder;
 use crate::engine::{Command, Engine};
 use crate::track::Track;
-use crate::ui::{menu, transport};
+use crate::track::peaks::TrackPeaks;
+use crate::ui::{menu, transport, waveform};
 
 enum LoadStatus {
     Idle,
     Loading(PathBuf),
-    Loaded { path: PathBuf, track: Arc<Track> },
-    Failed { path: PathBuf, error: String },
+    Loaded {
+        path: PathBuf,
+        track: Arc<Track>,
+        peaks: Arc<TrackPeaks>,
+    },
+    Failed {
+        path: PathBuf,
+        error: String,
+    },
 }
 
 struct LoadResult {
     path: PathBuf,
-    result: anyhow::Result<Track>,
+    result: anyhow::Result<(Arc<Track>, Arc<TrackPeaks>)>,
 }
 
 pub struct App {
@@ -59,7 +68,10 @@ impl App {
         self.status = LoadStatus::Loading(path.clone());
         let tx = self.load_tx.clone();
         thread::spawn(move || {
-            let result = decoder::decode_file(&path);
+            let result = decoder::decode_file(&path).map(|track| {
+                let peaks = Arc::new(TrackPeaks::compute(&track));
+                (Arc::new(track), peaks)
+            });
             let _ = tx.send(LoadResult { path, result });
             ctx.request_repaint();
         });
@@ -70,19 +82,19 @@ impl App {
             match self.load_rx.try_recv() {
                 Ok(LoadResult { path, result }) => {
                     self.status = match result {
-                        Ok(track) => {
+                        Ok((track, peaks)) => {
                             log::info!(
-                                "loaded {}: {} Hz, {} ch, {} frames",
+                                "loaded {}: {} Hz, {} ch, {} frames, {} peak buckets",
                                 path.display(),
                                 track.sample_rate,
                                 track.channels,
-                                track.frame_count()
+                                track.frame_count(),
+                                peaks.len(),
                             );
-                            let track = Arc::new(track);
                             if let Some(engine) = &self.engine {
                                 engine.send(Command::LoadTrack(track.clone()));
                             }
-                            LoadStatus::Loaded { path, track }
+                            LoadStatus::Loaded { path, track, peaks }
                         }
                         Err(e) => {
                             log::warn!("failed to load {}: {e:#}", path.display());
@@ -140,7 +152,7 @@ impl eframe::App for App {
                         ui.label(format!("Decoding {}…", path.display()));
                     });
                 }
-                LoadStatus::Loaded { path, track } => {
+                LoadStatus::Loaded { path, track, peaks } => {
                     ui.label(format!("File: {}", path.display()));
                     ui.label(format!(
                         "{} Hz · {} ch · {} frames",
@@ -149,7 +161,15 @@ impl eframe::App for App {
                         track.frame_count()
                     ));
                     ui.add_space(8.0);
+
                     if let Some(engine) = &self.engine {
+                        let position = engine.state().position.load(Ordering::Relaxed);
+                        if let Some(seek_to) =
+                            waveform::show(ui, peaks, position, track.frame_count(), 160.0)
+                        {
+                            engine.send(Command::Seek(seek_to));
+                        }
+                        ui.add_space(8.0);
                         transport::show(ui, engine, track.sample_rate, track.frame_count());
                     } else {
                         ui.colored_label(

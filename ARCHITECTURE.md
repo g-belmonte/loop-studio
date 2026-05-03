@@ -36,9 +36,13 @@ This document describes how Loop Studio is wired together. It is a living docume
 - Owns the DSP stage and the producer half of the ring buffer.
 - Pulls commands from the channel; reads source samples from the loaded `Track` (whole-file, decoded up front — see *Decode strategy* below); pushes processed samples into the ring buffer.
 - Maintains the playback cursor and applies loop wrap-around at the source.
-- Pre-computes a downsampled **peaks array** when a track loads (one min/max pair per N source frames) and shares it with the GUI via `Arc<TrackPeaks>`.
 
-> **Status:** engine thread is up (v0.1 step 2). It owns the cpal output stream, the ring producer, the cursor, and a `Box<dyn TimePitchProcessor>` (currently `Passthrough`). It does **not** own decoding — files are still decoded on a one-shot `std::thread` spawned from the GUI and handed to the engine via `Command::LoadTrack(Arc<Track>)`. Decoding may move into the engine later if streamed decode replaces whole-file decode.
+### Load-time worker (one-shot)
+- A `std::thread` spawned by `App` for each file open.
+- Decodes the file via `audio::decoder::decode_file`, then computes the GUI's `TrackPeaks` envelope (one min/max pair per `BUCKET_FRAMES` source frames).
+- Sends `Arc<Track>` and `Arc<TrackPeaks>` back to the GUI thread; the GUI hands the track to the engine via `Command::LoadTrack` and keeps the peaks for the waveform widget.
+
+> **Status:** engine thread is up (v0.1 step 2) — owns the cpal output stream, the ring producer, the cursor, and a `Box<dyn TimePitchProcessor>` (currently `Passthrough`). Decoding and peak computation live in the load-time worker (v0.1 steps 1 and 3) rather than the engine. They could move into the engine later if streamed decode ever replaces whole-file decode.
 
 ### Audio callback (`cpal`)
 - The only thread that touches the OS audio device.
