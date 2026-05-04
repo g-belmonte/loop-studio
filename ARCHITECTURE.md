@@ -12,24 +12,21 @@ This document describes how Loop Studio is wired together. It is a living docume
 ## Threads
 
 ```
-┌──────────────┐    commands     ┌─────────────┐  decoded   ┌──────────┐ samples ┌────────────┐
-│  GUI thread  │ ───────────────▶│  Engine     │──frames───▶│   DSP    │────────▶│   Audio    │
-│  (egui)      │   (crossbeam)   │  thread     │            │  stage   │   ring  │  callback  │
-│              │◀───── state ────│             │            │ (stretch │  buffer │   (cpal)   │
-└──────────────┘   (Arc<Atomic>) │             │            │  + pitch)│         └────────────┘
-                                 └─────────────┘            └──────────┘
-                                       │
-                                       ▼
-                                 ┌─────────────┐
-                                 │ Symphonia   │
-                                 │  decoder    │
-                                 └─────────────┘
+GUI (egui)  ──Command (crossbeam)──►  Engine worker  ──ringbuf──►  cpal callback
+     ▲                                  (DSP runs here)
+     └──── SharedState atomics ──────────────┘
+
+App (GUI thread) ──spawns std::thread──► Load-time worker (symphonia + peaks)
+                                              │
+                                              ▼
+                                  Arc<Track> sent back via crossbeam,
+                                  then handed to engine via Command::LoadTrack
 ```
 
 ### GUI thread (`eframe`)
 - Renders egui widgets every frame.
 - Reads playback state (position, RMS, etc.) via lock-free atomics.
-- Sends user intent (`Load`, `Play`, `Pause`, `Seek`, `SetLoop`, `SetSpeed`, `SetPitch`) to the engine over a `crossbeam-channel`.
+- Sends user intent (`LoadTrack`, `Play`, `Pause`, `Stop`, `Seek`, `SetLoop`, `SetSpeed`, `SetPitch`) to the engine over a `crossbeam-channel`.
 - Owns no audio data directly — it asks the engine.
 
 ### Engine thread
@@ -42,7 +39,7 @@ This document describes how Loop Studio is wired together. It is a living docume
 - Decodes the file via `audio::decoder::decode_file`, then computes the GUI's `TrackPeaks` envelope (one min/max pair per `BUCKET_FRAMES` source frames).
 - Sends `Arc<Track>` and `Arc<TrackPeaks>` back to the GUI thread; the GUI hands the track to the engine via `Command::LoadTrack` and keeps the peaks for the waveform widget.
 
-> **Status:** engine thread is up (v0.1 step 2) — owns the cpal output stream, the ring producer, the cursor, and a `Box<dyn TimePitchProcessor>` (currently `Passthrough`). Decoding and peak computation live in the load-time worker (v0.1 steps 1 and 3) rather than the engine. They could move into the engine later if streamed decode ever replaces whole-file decode.
+> **Status:** engine thread is up (v0.1 step 2) — owns the cpal output stream, the ring producer, the cursor, and a `Box<dyn TimePitchProcessor>` (currently `ResampleSpeed`, with `Passthrough` as fallback when the resampler can't be constructed). Decoding and peak computation live in the load-time worker (v0.1 steps 1 and 3) rather than the engine. They could move into the engine later if streamed decode ever replaces whole-file decode.
 
 ### Audio callback (`cpal`)
 - The only thread that touches the OS audio device.
@@ -52,7 +49,7 @@ This document describes how Loop Studio is wired together. It is a living docume
 
 ## Data flow for one playback frame
 
-1. **Input**: engine has read N source samples from `symphonia` (post-loop-wrap).
+1. **Input**: engine has read N source samples from the loaded `Arc<Track>` (post-loop-wrap or loop-stitch).
 2. **Time-stretch**: the DSP stage consumes them at rate `1/speed` and emits time-stretched samples at the same pitch.
 3. **Pitch-shift**: applied by resampling the time-stretched output to shift pitch (or by an integrated phase-vocoder that does both at once — see DSP section).
 4. **Output**: pushed into the ring buffer for the audio callback.
@@ -104,26 +101,27 @@ src/
 ```rust
 // engine/command.rs
 pub enum Command {
-    Load(PathBuf),
+    LoadTrack(Arc<Track>),     // engine takes ownership, resets cursor
     Play,
     Pause,
-    Seek(u64),                 // sample index in source
+    Stop,                      // pause + reset cursor to 0
+    Seek(u64),                 // source frame index
     SetLoop(Option<LoopRegion>),
     SetSpeed(f32),             // 0.25..=2.0
     SetPitch(f32),             // semitones, -12.0..=12.0
 }
 
 // track/mod.rs
-pub struct LoopRegion { pub start: u64, pub end: u64 } // source-sample indices
+pub struct LoopRegion { pub start: u64, pub end: u64 } // source-frame indices
 
 // engine/state.rs — read by GUI, written by engine
 pub struct SharedState {
-    pub position:   AtomicU64,  // current source-sample index
-    pub duration:   AtomicU64,
-    pub playing:    AtomicBool,
-    pub speed:      AtomicU32,  // f32 bits
-    pub pitch:      AtomicU32,
-    pub loaded_id:  AtomicU64,  // bump when a new track is ready
+    pub position:    AtomicU64,  // current source-frame index
+    pub duration:    AtomicU64,  // total source frames
+    pub playing:     AtomicBool,
+    pub speed_bits:  AtomicU32,  // f32::to_bits()
+    pub pitch_bits:  AtomicU32,  // f32::to_bits()
+    pub loaded_id:   AtomicU64,  // bumped on each LoadTrack
 }
 
 // dsp/mod.rs
@@ -144,11 +142,31 @@ Independent time-stretch and pitch-shift is the hardest part of this project. We
 
 1. **Phase 1 — Passthrough** (`dsp/passthrough.rs`). ✅ Done. Wired the engine end-to-end with no DSP. Now serves as a fallback when the resampler can't be constructed.
 2. **Phase 2 — Speed-coupled** (`dsp/resample.rs`). ✅ Done in v0.1 step 5. `rubato::SincFixedIn`, chunk = 1024 frames, `max_resample_ratio_relative = 4.0`. Speed slider works; pitch is coupled to speed (turntable).
-3. **Phase 3 — WSOLA + resample** (`dsp/wsola.rs`). Implement WSOLA (Waveform-Similarity Overlap-Add) for time-stretch — ~200 lines, works in the time domain, low-latency. Cascade with `rubato` for pitch shift. This is the MVP target.
+3. **Phase 3 — WSOLA + resample** (`dsp/wsola.rs`). Implement WSOLA (Waveform-Similarity Overlap-Add) for time-stretch — ~200 lines, works in the time domain, low-latency. Cascade with `rubato` for pitch shift. This is the MVP target. **Subdivided into v0.1 steps 6a and 6b — see plan below.**
 4. **Phase 4 — Phase vocoder** (optional). If WSOLA quality isn't enough on harmonic material, add an FFT-based phase vocoder behind the same trait.
 5. **Phase 5 — FFI** (optional, license-permitting). Rubber Band or SoundTouch as opt-in features for top-tier quality.
 
 The `TimePitchProcessor` trait keeps the engine ignorant of which phase we're in.
+
+### Step 6 plan (next up — Phase 3, subdivided)
+
+**Step 6a — WSOLA-based speed processor.**
+- Implement WSOLA in `dsp/wsola.rs`: time-domain frame extraction, cross-correlation similarity search around the analysis position, Hann-windowed overlap-add. Typical parameters to start: frame size 2048, analysis hop 512, search radius ±256, 50 % overlap. One `Wsola` instance per channel.
+- Wrap in a `WsolaSpeed` struct implementing `TimePitchProcessor`. `set_speed(s)` sets `stretch_factor = 1/s`; `set_pitch_semitones` is a no-op (still a placeholder).
+- Replace `ResampleSpeed` with `WsolaSpeed` in `engine::worker::make_dsp`.
+- Result: existing speed slider preserves pitch — the "vinyl" interim from step 5 is gone. No pitch slider yet.
+- Risks: chunk-boundary continuity (engine calls `process()` in 1024-frame chunks; WSOLA's frame size is larger, so internal state must survive across calls); transient smearing on drums; phasiness on sustained tones. Validation is audible only.
+
+**Step 6b — Pitch shift cascade + slider UI.**
+- Build a composite DSP that owns a `Wsola` and a `rubato::SincFixedIn`, plumbed back-to-back: WSOLA stretches in time, the resampler shifts pitch by changing playback rate.
+- Math (verified): `stretch_factor = 2^(pitch_semitones/12) / speed`; `resample_ratio = 2^(-pitch_semitones/12)`. Both setters recompute both stages. At `(speed=1, pitch=0)` both stages are identity; at `(speed=0.5, pitch=0)` only WSOLA stretches; at `(speed=1, pitch=+12)` WSOLA stretches 2× and the resampler resamples 0.5× (net duration unchanged, pitch up an octave).
+- Wire `Command::SetPitch` end-to-end (it's already plumbed but no-op).
+- Add a pitch slider to `ui::transport`: range ±12 semitones, "0 st" reset button, sends `Command::SetPitch`.
+- Risks: ratio math correctness (test by ear at multiple `(speed, pitch)` combinations); whether `WSOLA::set_stretch_factor` needs ramping to avoid clicks when the user drags either slider — `rubato::set_resample_ratio(_, ramp=true)` already smooths the resampler side.
+
+**Why this split (and not more)**: a "WSOLA without engine integration" sub-step would just be dead code that can't be validated until wired in — quality is only audible after integration. Step 6a is the minimum unit that's both meaningful and testable. Step 6b is mostly composition + UI; the algorithmic risk is contained in 6a.
+
+**Detour clause**: if 6a's audible quality is unacceptable, jump to Phase 4 (FFT phase vocoder) before doing 6b. The trait shape doesn't need to change.
 
 ## Why a custom mixer instead of `rodio`
 
@@ -173,7 +191,7 @@ Versioned from day one so we can migrate without breaking saved sessions.
 ## Decisions
 
 - **Decode strategy = whole-file** (decided v0.1 step 1). `audio::decoder::decode_file` reads the entire file into a `Track { samples: Vec<f32>, ... }` of interleaved f32. Cost: ~1.3 GB RAM for a 1-hour 44.1 kHz stereo track. Acceptable for a practice tool that mostly chews on 3–8 minute songs. Revisit if real-world use surfaces long-form pain (audiobooks, full concerts).
-- **Output stream rate = track rate when supported, device default otherwise** (decided v0.1 step 2). `audio::output::open` first tries to build an F32 stream at the track's exact rate and channel count; if that fails it falls back to `default_output_config()` and logs a warning that playback rate will be wrong. Resampling for mismatched rates lands naturally with the rubato stage in step 4. The stream is reopened on every `LoadTrack` whose rate or channel count differs from the current stream.
+- **Output stream rate = track rate when supported, device default otherwise** (decided v0.1 step 2). `audio::output::open` first tries to build an F32 stream at the track's exact rate and channel count; if that fails it falls back to `default_output_config()` and logs a warning that playback rate will be wrong. Resampling for mismatched rates would naturally piggyback on the rubato stage that landed in step 5, but isn't implemented yet — the warning still fires when rates don't match. The stream is reopened on every `LoadTrack` whose rate or channel count differs from the current stream.
 
   We deliberately do **not** call `device.supported_output_configs()`. On Linux with pipewire-alsa it errors out during the probe ("device no longer available") even though `build_output_stream` against the same device works fine. Try-then-fall-back is more robust than enumerate-then-build on every backend we've encountered.
 - **Ring buffer size = 16384 interleaved samples** (decided v0.1 step 2, raised in step 5). About 170 ms at 48 kHz stereo. The original 8192 was right when the DSP was passthrough but became a deadlock once `ResampleSpeed` arrived: with `max_resample_ratio_relative = 4.0` and `chunk = 1024`, the resampler's worst-case output is 4096 frames = 8192 stereo samples, so an 8192-sample ring could only ever be refilled when fully empty. Doubling the ring gives the engine room to refill while the callback is still draining. The engine wakes every 2 ms.

@@ -8,6 +8,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `README.md` tracks the v0.1 roadmap as a checkbox list. Tick the box in the same change that implements the item.
 
+## Next planned work
+
+The next checkbox is **pitch shift via WSOLA**, subdivided into two sub-steps. **Read the "Step 6 plan" section of `ARCHITECTURE.md`** before starting — it has the algorithm parameters to start with, the exact stretch/resample math, the chunk-boundary risks, and the detour clause if WSOLA quality turns out unacceptable. Brief: 6a replaces `ResampleSpeed` with a WSOLA-based speed processor (speed slider preserves pitch, no pitch slider yet); 6b adds the pitch-shift cascade and the slider UI.
+
 ## Commands
 
 ```sh
