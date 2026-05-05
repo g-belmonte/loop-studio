@@ -141,7 +141,7 @@ Independent time-stretch and pitch-shift is the hardest part of this project. We
 
 1. **Phase 1 — Passthrough** (`dsp/passthrough.rs`). ✅ Done. Wired the engine end-to-end with no DSP. Now serves as a fallback when DSP construction is degenerate (e.g. zero-channel track).
 2. **Phase 2 — Speed-coupled** (was `dsp/resample.rs`). ✅ Done in v0.1 step 5; **removed in step 6a** when `WsolaSpeed` replaced it. Used `rubato::SincFixedIn` with chunk = 1024 and `max_resample_ratio_relative = 4.0`. Speed slider worked but pitch was coupled to speed (turntable). Step 6b reintroduced a `rubato::SincFixedIn` *inside the WSOLA composite* (`WsolaPitchShift`) — same crate, no longer standalone.
-3. **Phase 3 — WSOLA + resample** (`dsp/wsola.rs`). Time-domain WSOLA for time-stretch — pure-Rust, low-latency. Cascade with `rubato` for pitch shift. This is the MVP target. **Subdivided into v0.1 steps 6a and 6b — see plan below.** ✅ 6a done (`WsolaSpeed`); ✅ 6b done — `WsolaPitchShift` composite drives the engine, and the pitch slider is live in `ui::transport`.
+3. **Phase 3 — WSOLA + resample** (`dsp/wsola.rs`). Time-domain WSOLA for time-stretch — pure-Rust, low-latency. Cascade with `rubato` for pitch shift. This is the MVP target. **Subdivided into v0.1 steps 6a and 6b plus a v0.2 quality pass 6c — see plan below.** ✅ 6a done (`WsolaSpeed`); ✅ 6b done — `WsolaPitchShift` composite drives the engine, and the pitch slider is live in `ui::transport`; ✅ 6c done — AMDF + mono-mix similarity search, unity-gain OLA, and ramped stretch transitions.
 4. **Phase 4 — Phase vocoder** (optional). If WSOLA quality isn't enough on harmonic material, add an FFT-based phase vocoder behind the same trait.
 5. **Phase 5 — FFI** (optional, license-permitting). Rubber Band or SoundTouch as opt-in features for top-tier quality.
 
@@ -167,23 +167,21 @@ The `TimePitchProcessor` trait keeps the engine ignorant of which phase we're in
 - Pitch slider in `ui::transport`: linear range ±12 semitones (perceptually equal steps), "0 st" reset button, sends `Command::SetPitch`. Paired with the existing logarithmic speed slider; both follow the same shape (slider + reset).
 - Risks (still open until audible verification): ratio math correctness across multiple `(speed, pitch)` combinations; whether WSOLA's stretch change needs ramping to avoid clicks during slider drags (`rubato::set_resample_ratio(_, ramp=true)` already smooths the resampler side). Detour clause: if quality is unacceptable on harmonic material, jump to Phase 4 (FFT phase vocoder) — the trait shape doesn't need to change.
 
-### Step 6c plan — WSOLA quality pass (queued)
+### Step 6c — WSOLA quality pass. ✅ Done.
 
-Early audible testing of step 6b surfaced two issues we deferred for a focused follow-up:
+Early audible testing of step 6b surfaced two issues that triggered this pass:
 - Pitch-shift quality is asymmetric — pitching down is mostly OK, pitching up is noticeably distorted on harmonic content.
 - Audible clicks appear when sliders are at non-default settings, especially during drags.
 
-Three targeted fixes, each independently testable:
+Three independent fixes, all in `dsp/wsola.rs`:
 
-1. **Similarity search → AMDF.** Replace the raw cross-correlation in `Wsola::step` with AMDF (`Σ |nat_ref[i] − in_buf[start+i]|`, minimised over δ). Raw correlation is biased toward high-energy regions of the input and picks poor frame alignments on tonal content; AMDF normalises against the local envelope without the cost of full normalised cross-correlation. Also worth considering: search over a sum-of-channels mono mix instead of channel 0 only, so stereo content with diverging channels doesn't mis-steer the search.
-2. **OLA gain compensation.** Symmetric Hann at hop = N/4 has a COLA sum ≈ 1.75, so the OLA output is ~5 dB hot and clips on loud sources. Divide the precomputed `window` by the COLA constant in `Wsola::new` so identity (stretch = 1) is unity-gain. Cheap, definitively correct, and explains why clipping might appear at any non-passthrough setting.
-3. **Stretch ramping.** Currently `Wsola::set_stretch` swaps `analysis_hop` instantly while `rubato::set_resample_ratio(_, ramp=true)` already smooths the resampler side. The asymmetry produces phase glitches when the user drags a slider. Fix: store both `current_analysis_hop` and `target_analysis_hop`, and step `current` toward `target` by a bounded delta per synthesis step.
+1. **Similarity search → AMDF over a sum-of-channels mono mix.** `Wsola::step` now minimises `Σ |nat_ref_mono[i] − in_mono[start+i]|` instead of maximising a raw cross-correlation. AMDF normalises against the local envelope without the cost of normalised cross-correlation. The mono mix (channels summed before the AMDF) is built once per step into `nat_ref_mono` and `in_mono` scratch buffers — the inner δ loop runs over a single channel-summed signal, which is also faster than re-summing per δ. Channel-0-only worked on most content but mis-steered on stereo material with diverging channels (decorrelated reverb tails, hard-panned ornamentation). Single δ across channels is unchanged — stereo image stays coherent.
+2. **OLA gain compensation.** `Wsola::new` now computes the steady-state OLA sum of the Hann window at `SYNTHESIS_HOP` and divides the window by it, so identity (stretch = 1) is unity-gain. For symmetric Hann at hop = N/4 the constant lands at ~2.0 (slightly higher than the periodic-Hann textbook value of 1.5 because of the (N-1) denominator and where the synthesis-hop offsets land); the code computes it from the actual window so the constant tracks any future change to either the window shape or the hop.
+3. **Stretch ramping.** `Wsola` now tracks `target_stretch` separately from the active `stretch`. `set_stretch` only updates the target; `advance_stretch_ramp` (called at the top of every `step`) steps `stretch` toward `target` by at most `STRETCH_RAMP_PER_STEP = 0.1` per synthesis step. Living in synthesis-step time (rather than wall-clock or per-set_stretch-call) keeps the ramp rate proportional to the audio timeline. Snaps to target once within half a step to avoid FP drift. A 1× → 4× extreme reset converges in ~30 synth steps ≈ 350 ms — fast enough to feel responsive, slow enough to be glitch-free. rubato's existing `set_resample_ratio(_, ramp=true)` keeps doing what it did; the two sides ramp independently and the architecture knowingly accepts that during a pitch-only slider drag the *intermediate* composite duration ratio departs slightly from `1/speed` until WSOLA catches up.
 
-Risks: each fix is local and reversible; AMDF is the highest-impact and the most likely to also subtly change perceived character (some material may sound different, not strictly better). Validation is audible only — exercise the pitch-up direction on solo voice or sustained tones, and drag both sliders during playback to listen for clicks.
+Plumbing: WSOLA's `effective_stretch()` returns `max(stretch, target_stretch)`. `WsolaSpeed::expected_output_frames_per_chunk` and `WsolaPitchShift::expected_output_frames_per_chunk` use it so a ramp-down (target < current) doesn't under-reserve ring vacancy and silently drop samples through `push_slice`. `WsolaPitchShift::process` uses `target_stretch` as the synth target (rather than the lagging current) so the resampler doesn't starve mid-transition.
 
 Detour clause unchanged: if 6c isn't enough on harmonic material, the trait shape supports a drop-in replacement with Phase 4 (FFT phase vocoder).
-
-v0.1's session save/load shipped before 6c — 6c is a quality polish on existing features, not a blocker for shipping v0.1.
 
 ## Why a custom mixer instead of `rodio`
 

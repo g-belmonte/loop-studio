@@ -2,6 +2,9 @@
 // Step 6a: speed-only WSOLA preserves pitch (`WsolaSpeed`).
 // Step 6b: cascade WSOLA with a rubato resampler for independent pitch shift
 // (`WsolaPitchShift`).
+// Step 6c: AMDF similarity search over a sum-of-channels mono mix; window
+// divided by the steady-state OLA sum for unity-gain identity; `stretch`
+// ramps toward `target_stretch` per synthesis step instead of snapping.
 
 use anyhow::{Context, Result};
 use rubato::{
@@ -15,7 +18,7 @@ const FRAME_SIZE: usize = 2048;
 /// Synthesis hop. With Hann + hop = N/4 we get COLA (constant overlap-add).
 const SYNTHESIS_HOP: usize = 512;
 /// ± frames around the nominal analysis position when searching for the
-/// best-matching frame (similarity criterion: cross-correlation against the
+/// best-matching frame (similarity criterion: AMDF against the
 /// natural-progression reference from the previous step).
 const SEARCH_RADIUS: usize = 256;
 /// Overlap region between adjacent synthesis frames.
@@ -29,6 +32,13 @@ const ENGINE_CHUNK_FRAMES: usize = 1024;
 /// (speed = 0.25× combined with pitch = +12 st → stretch = 2 / 0.25 = 8).
 const MIN_STRETCH: f32 = 0.25;
 const MAX_STRETCH: f32 = 8.0;
+
+/// Maximum change in `stretch` per synthesis step (step 6c, fix #3). Smooths
+/// slider drags / reset jumps so `analysis_hop` doesn't snap, which causes
+/// audible clicks at ratio boundaries. With ~22 synth steps/sec at 44.1 kHz,
+/// 0.1 means a 1× → 4× extreme reset converges in ~30 steps ≈ 350 ms — fast
+/// enough to feel responsive, slow enough to be glitch-free.
+const STRETCH_RAMP_PER_STEP: f32 = 0.1;
 
 /// Upper bound on output frames per `process()` call for `WsolaSpeed` (which
 /// clamps stretch ≤ 4 — speed slider range). Worst case at stretch = 4:
@@ -65,7 +75,7 @@ pub struct Wsola {
 
     /// Natural-progression reference: the un-windowed tail of the previously
     /// extracted frame, offset by SYNTHESIS_HOP. Used as the target signal in
-    /// the cross-correlation search for the next step's best δ.
+    /// the AMDF search for the next step's best δ (see step 6c).
     nat_ref: Vec<Vec<f32>>,
     /// Whether `nat_ref` has been populated (false until the first step runs).
     nat_ref_valid: bool,
@@ -73,12 +83,28 @@ pub struct Wsola {
     /// Per-channel queue of synthesized output samples not yet drained.
     out_queue: Vec<Vec<f32>>,
 
-    /// Pre-computed Hann window of length FRAME_SIZE.
+    /// Pre-computed Hann window of length FRAME_SIZE, divided by the COLA sum
+    /// so identity (stretch = 1) is unity-gain. Without the compensation, OLA
+    /// at hop = N/4 with a symmetric Hann produces output a few dB hot — see
+    /// step 6c, fix #2.
     window: Vec<f32>,
     /// Per-channel scratch for the extracted (un-windowed and then windowed) frame.
     extract: Vec<Vec<f32>>,
 
-    /// stretch = 1 / speed, clamped to [MIN_STRETCH, MAX_STRETCH].
+    /// Mono-mixed natural-progression reference (length OVERLAP). Reused as
+    /// the AMDF target each step so the search isn't channel-0-biased on
+    /// stereo content with diverging channels (step 6c, fix #1).
+    nat_ref_mono: Vec<f32>,
+    /// Mono-mixed search region of `in_buf` (length 2·SEARCH_RADIUS + OVERLAP).
+    /// Precomputed once per step so the inner δ loop runs over a single
+    /// channel-summed signal.
+    in_mono: Vec<f32>,
+
+    /// Where `set_stretch` writes; the actual `stretch` ramps toward this
+    /// over multiple synthesis steps (step 6c, fix #3).
+    target_stretch: f32,
+    /// Currently-active stretch, ∈ [MIN_STRETCH, MAX_STRETCH]. Lags
+    /// `target_stretch` during transitions.
     stretch: f32,
     /// analysis_hop = max(1, round(SYNTHESIS_HOP / stretch)).
     analysis_hop: usize,
@@ -86,12 +112,36 @@ pub struct Wsola {
 
 impl Wsola {
     pub fn new(channels: usize) -> Self {
-        let window: Vec<f32> = (0..FRAME_SIZE)
+        let mut window: Vec<f32> = (0..FRAME_SIZE)
             .map(|i| {
                 0.5 - 0.5
                     * ((2.0 * std::f32::consts::PI * i as f32) / (FRAME_SIZE as f32 - 1.0)).cos()
             })
             .collect();
+
+        // Step 6c, fix #2: divide the window by the steady-state OLA sum so
+        // identity (stretch = 1) is unity-gain. Computed against `window` (not
+        // hard-coded) so the constant stays tied to the actual (window shape,
+        // hop) rather than a magic number — for symmetric Hann at hop = N/4
+        // it lands at ~2.0; this stays correct if either is changed.
+        // We evaluate at p = FRAME_SIZE — past the boundary frames at p < N
+        // where contributions are partial.
+        let cola_sum: f32 = {
+            let p = FRAME_SIZE;
+            let m_max = p / SYNTHESIS_HOP;
+            let m_min = (p + 1).saturating_sub(FRAME_SIZE).div_ceil(SYNTHESIS_HOP);
+            let mut s = 0.0_f32;
+            for m in m_min..=m_max {
+                let offset = p - m * SYNTHESIS_HOP;
+                if offset < FRAME_SIZE {
+                    s += window[offset];
+                }
+            }
+            s
+        };
+        for w in window.iter_mut() {
+            *w /= cola_sum;
+        }
 
         Self {
             channels,
@@ -104,19 +154,47 @@ impl Wsola {
             out_queue: vec![Vec::with_capacity(ADAPTER_MAX_OUTPUT_FRAMES_PER_CHUNK); channels],
             window,
             extract: vec![vec![0.0; FRAME_SIZE]; channels],
+            nat_ref_mono: vec![0.0; OVERLAP],
+            in_mono: vec![0.0; 2 * SEARCH_RADIUS + OVERLAP],
+            target_stretch: 1.0,
             stretch: 1.0,
             analysis_hop: SYNTHESIS_HOP,
         }
     }
 
+    /// Set the *target* stretch. The active `stretch` ramps toward it on each
+    /// synthesis step — see `advance_stretch_ramp`. Setting `target_stretch`
+    /// has no immediate effect on the next-emitted frame; it only changes
+    /// where future frames are headed.
     pub fn set_stretch(&mut self, stretch: f32) {
-        let s = stretch.clamp(MIN_STRETCH, MAX_STRETCH);
-        self.stretch = s;
-        self.analysis_hop = ((SYNTHESIS_HOP as f32 / s).round() as usize).max(1);
+        self.target_stretch = stretch.clamp(MIN_STRETCH, MAX_STRETCH);
     }
 
-    pub fn stretch(&self) -> f32 {
-        self.stretch
+    /// Most-recently-requested stretch.
+    pub fn target_stretch(&self) -> f32 {
+        self.target_stretch
+    }
+
+    /// Larger of `stretch` and `target_stretch` — the conservative upper
+    /// bound on output rate the engine should plan ring vacancy against
+    /// during a ramp-down (otherwise the ring's `push_slice` silently drops
+    /// the excess).
+    pub fn effective_stretch(&self) -> f32 {
+        self.stretch.max(self.target_stretch)
+    }
+
+    /// Step `stretch` toward `target_stretch` by at most `STRETCH_RAMP_PER_STEP`.
+    /// Called at the top of every `step()` so the ramp lives in synthesis-step
+    /// time rather than wall-clock time. Snaps to target once we're within
+    /// half a step to avoid drifting forever from FP rounding.
+    fn advance_stretch_ramp(&mut self) {
+        let diff = self.target_stretch - self.stretch;
+        if diff.abs() <= STRETCH_RAMP_PER_STEP * 0.5 {
+            self.stretch = self.target_stretch;
+        } else {
+            self.stretch += diff.signum() * STRETCH_RAMP_PER_STEP;
+        }
+        self.analysis_hop = ((SYNTHESIS_HOP as f32 / self.stretch).round() as usize).max(1);
     }
 
     /// Append `frames` interleaved input frames to the per-channel buffer.
@@ -189,6 +267,12 @@ impl Wsola {
     /// Run one WSOLA analysis-synthesis step. Returns true on success, false
     /// if not enough input is buffered yet.
     fn step(&mut self) -> bool {
+        // Step 6c, fix #3: ramp the active stretch toward target before this
+        // step's analysis_hop is used. Putting it here (vs. in set_stretch)
+        // means the ramp rate is governed by synthesis-step rate, so it stays
+        // proportional to the audio timeline regardless of slider event rate.
+        self.advance_stretch_ramp();
+
         // We may search up to +SEARCH_RADIUS from analysis_pos and read
         // FRAME_SIZE samples from there — bound the read window to in_buf.
         let needed_end = self.analysis_pos + SEARCH_RADIUS + FRAME_SIZE;
@@ -196,29 +280,53 @@ impl Wsola {
             return false;
         }
 
-        // 1. Find best δ ∈ [-Δ, +Δ]. Cross-correlate the natural-progression
-        //    reference (from the previous step) against the input window
-        //    around analysis_pos. Use channel 0 — keeping a single δ across
-        //    channels preserves stereo image. On the first step there's no
-        //    reference, so δ = 0.
+        // 1. Find best δ ∈ [-Δ, +Δ]. Step 6c, fix #1: AMDF (sum of absolute
+        //    differences) over a sum-of-channels mono mix, minimised. Raw
+        //    cross-correlation was biased toward high-energy regions and
+        //    picked poor frame alignments on tonal content; AMDF normalises
+        //    against the local envelope without the cost of a full
+        //    normalised cross-correlation. Mono mix (rather than channel 0)
+        //    keeps stereo content with diverging channels from mis-steering
+        //    the search. Single δ per step → stereo image stays coherent.
+        //    On the first step there's no reference, so δ = 0.
         let delta: isize = if !self.nat_ref_valid {
             0
         } else {
-            let in0 = &self.in_buf[0];
-            let r0 = &self.nat_ref[0];
             let center = self.analysis_pos as isize;
             // Don't search before the start of the buffer.
             let lo = -(self.analysis_pos.min(SEARCH_RADIUS) as isize);
             let hi = SEARCH_RADIUS as isize;
+
+            // Build the mono mixes once per step — the inner δ loop then
+            // works on a single channel-summed signal, avoiding a per-d
+            // re-sum across channels. Scale (1/channels) is omitted because
+            // it's a constant factor across all δ and doesn't affect argmin.
+            for i in 0..OVERLAP {
+                let mut s = 0.0_f32;
+                for ch in 0..self.channels {
+                    s += self.nat_ref[ch][i];
+                }
+                self.nat_ref_mono[i] = s;
+            }
+            let region_start = (center + lo) as usize;
+            let region_len = (hi - lo) as usize + OVERLAP;
+            for i in 0..region_len {
+                let mut s = 0.0_f32;
+                for ch in 0..self.channels {
+                    s += self.in_buf[ch][region_start + i];
+                }
+                self.in_mono[i] = s;
+            }
+
             let mut best_d: isize = 0;
-            let mut best_score = f32::NEG_INFINITY;
+            let mut best_score = f32::INFINITY;
             for d in lo..=hi {
-                let start = (center + d) as usize;
+                let start = (d - lo) as usize;
                 let mut score = 0.0_f32;
                 for i in 0..OVERLAP {
-                    score += r0[i] * in0[start + i];
+                    score += (self.nat_ref_mono[i] - self.in_mono[start + i]).abs();
                 }
-                if score > best_score {
+                if score < best_score {
                     best_score = score;
                     best_d = d;
                 }
@@ -334,7 +442,9 @@ impl TimePitchProcessor for WsolaSpeed {
 
     fn expected_output_frames_per_chunk(&self) -> usize {
         // Steady-state: per ENGINE_CHUNK input we emit ENGINE_CHUNK × stretch.
-        let est = (ENGINE_CHUNK_FRAMES as f32 * self.inner.stretch).ceil() as usize;
+        // Use the larger of current and target so a ramp-down (current > target)
+        // doesn't under-reserve ring vacancy and silently drop samples.
+        let est = (ENGINE_CHUNK_FRAMES as f32 * self.inner.effective_stretch()).ceil() as usize;
         est.clamp(1, ADAPTER_MAX_OUTPUT_FRAMES_PER_CHUNK)
     }
 
@@ -484,8 +594,15 @@ impl TimePitchProcessor for WsolaPitchShift {
     }
 
     fn expected_output_frames_per_chunk(&self) -> usize {
-        // Net composite ratio is 1/speed (pitch is duration-neutral).
-        let est = (ENGINE_CHUNK_FRAMES as f32 / self.speed).ceil() as usize;
+        // Steady-state net composite ratio is 1/speed (pitch is duration-neutral).
+        // During a WSOLA ramp-down, however, current_stretch > target_stretch
+        // while rubato has already ramped to the new ratio, so the composite
+        // can transiently exceed 1/speed. Compute the worst-case ratio from the
+        // larger WSOLA stretch × current resample ratio.
+        let pitch_factor = 2.0_f32.powf(self.pitch_semitones / 12.0);
+        let resample_ratio = 1.0 / pitch_factor;
+        let est = (ENGINE_CHUNK_FRAMES as f32 * self.wsola.effective_stretch() * resample_ratio)
+            .ceil() as usize;
         est.clamp(1, ADAPTER_MAX_OUTPUT_FRAMES_PER_CHUNK)
     }
 
@@ -513,9 +630,12 @@ impl TimePitchProcessor for WsolaPitchShift {
 
         // 1. Feed WSOLA, run synthesis until it has produced ~one chunk's
         //    worth of stretched output (steady-state per-call expectation).
+        //    We aim for `target_stretch` rather than the currently-active
+        //    stretch — the latter lags during a ramp, and using it as the
+        //    synth target would let the resampler starve mid-transition.
         self.wsola.ingest(input, ENGINE_CHUNK_FRAMES);
         let stretch_target =
-            (ENGINE_CHUNK_FRAMES as f32 * self.wsola.stretch()).ceil() as usize;
+            (ENGINE_CHUNK_FRAMES as f32 * self.wsola.target_stretch()).ceil() as usize;
         self.wsola.synthesize_up_to(stretch_target);
 
         // 2. Pull all WSOLA output into wsola_drain (per-channel, planar).

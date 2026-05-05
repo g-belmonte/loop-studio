@@ -10,10 +10,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Next planned work
 
-v0.1 is closed: every checkbox in the v0.1 roadmap is ticked (open file, transport, waveform, A/B loop, speed slider, pitch slider, session save/load). What's queued:
+v0.1 is closed and the first v0.2 thread (step 6c — WSOLA quality pass) is in: AMDF similarity search over a sum-of-channels mono mix, unity-gain OLA, and ramped stretch transitions. Audible verification of 6c is still owed — exercise pitch-up on solo voice or sustained tones, drag both sliders during playback to confirm the clicks are gone. If quality isn't there, the detour clause stands: jump to Phase 4 (FFT phase vocoder).
 
-- **Step 6c — WSOLA quality pass** (v0.2-tagged but doable any time). Audible testing surfaced pitch-up distortion and clicks at non-default settings. Three targeted fixes: switch the similarity search from raw cross-correlation to AMDF; compensate the OLA gain (Hann at hop=N/4 has COLA ≈ 1.75, so output is ~5 dB hot); ramp WSOLA's stretch factor so it matches rubato's already-ramped ratio. Full plan in `ARCHITECTURE.md` "Step 6c plan". Detour clause: if 6c isn't enough, jump to Phase 4 (FFT phase vocoder).
-- **The rest of v0.2** — keyboard shortcuts, markers, per-track session auto-save, waveform zoom, cents-level pitch nudge.
+What's queued for the rest of v0.2:
+
+- Keyboard shortcuts (space, arrows, `[`/`]` for loop points).
+- Markers / cue points.
+- Per-track session auto-save.
+- Waveform zoom + scroll.
+- Cents-level pitch nudge.
 
 Ask the user which thread they want before starting — the order isn't determined.
 
@@ -63,7 +68,9 @@ App (GUI thread) ──spawns std::thread──► Load-time worker (decode + pe
 `TimePitchProcessor` (in `src/dsp/mod.rs`) abstracts time-stretch + pitch-shift. The engine is chunk-aware: it queries `input_frames_per_chunk()`, `max_output_frames_per_chunk()` (for scratch sizing), and `expected_output_frames_per_chunk()` (for ring-vacancy checking — returning the max here would deadlock when the worst-case output far exceeds the steady-state output). Implementations live in `src/dsp/`:
 
 - `passthrough.rs` — identity, ultimate fallback (degenerate channel count).
-- `wsola.rs` — `Wsola` (streaming WSOLA, frame 2048 / hop 512 / search ±256 / Hann), plus two `TimePitchProcessor` adapters: `WsolaSpeed` (speed-only, used as fallback when the rubato resampler in the composite can't be constructed) and `WsolaPitchShift` (the active path — composite that cascades `Wsola` with `rubato::SincFixedIn` chunk = 1024, `max_resample_ratio_relative = 4.0`). `WsolaPitchShift::recompute` enforces the cascade math: `stretch = 2^(p/12) / speed` for WSOLA, `ratio = 1 / 2^(p/12)` for rubato, net composite ratio = `1/speed`.
+- `wsola.rs` — `Wsola` (streaming WSOLA, frame 2048 / hop 512 / search ±256 / Hann, AMDF similarity search over a sum-of-channels mono mix, unity-gain OLA via window/COLA-sum compensation, ramped stretch via `target_stretch`/`STRETCH_RAMP_PER_STEP` — see step 6c), plus two `TimePitchProcessor` adapters: `WsolaSpeed` (speed-only, used as fallback when the rubato resampler in the composite can't be constructed) and `WsolaPitchShift` (the active path — composite that cascades `Wsola` with `rubato::SincFixedIn` chunk = 1024, `max_resample_ratio_relative = 4.0`). `WsolaPitchShift::recompute` enforces the cascade math: `stretch = 2^(p/12) / speed` for WSOLA, `ratio = 1 / 2^(p/12)` for rubato, net composite ratio = `1/speed`.
+
+  `Wsola::effective_stretch()` (the larger of current and target) is what both adapters report through `expected_output_frames_per_chunk` so a ramp-down doesn't under-reserve ring vacancy and silently drop samples in `push_slice`.
 
 When you change the DSP plan, edit the "DSP" section of `ARCHITECTURE.md` so the staged phases stay accurate.
 

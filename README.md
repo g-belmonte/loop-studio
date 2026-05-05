@@ -13,7 +13,7 @@ A practice-focused music player for musicians who learn by ear. Open a track, ma
 
 ## Status
 
-v0.1 (MVP) shipped: every checkbox below in the v0.1 list is implemented. Active work is moving to v0.2 — the next thread on deck is the WSOLA quality pass (see `ARCHITECTURE.md` step 6c).
+v0.1 (MVP) shipped: every checkbox below in the v0.1 list is implemented. Active work is moving to v0.2 — first WSOLA quality pass (step 6c) is in (AMDF similarity search, unity-gain OLA, ramped stretch transitions).
 
 ## Tech stack
 
@@ -49,7 +49,7 @@ See [ARCHITECTURE.md](./ARCHITECTURE.md) for thread layout, data flow, and modul
 - [ ] Per-track session auto-save.
 - [ ] Zoom + scroll on waveform.
 - [ ] Cents-level pitch nudge.
-- [ ] WSOLA quality pass: AMDF similarity search, OLA gain compensation, stretch ramping (see [ARCHITECTURE.md step 6c](./ARCHITECTURE.md#step-6c-plan--wsola-quality-pass-queued)).
+- [x] WSOLA quality pass: AMDF similarity search, OLA gain compensation, stretch ramping (see [ARCHITECTURE.md step 6c](./ARCHITECTURE.md#step-6c--wsola-quality-pass--done)).
 
 ### v0.3 — Practice features
 
