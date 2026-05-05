@@ -142,10 +142,10 @@ Independent time-stretch and pitch-shift is the hardest part of this project. We
 1. **Phase 1 — Passthrough** (`dsp/passthrough.rs`). ✅ Done. Wired the engine end-to-end with no DSP. Now serves as a fallback when DSP construction is degenerate (e.g. zero-channel track).
 2. **Phase 2 — Speed-coupled** (was `dsp/resample.rs`). ✅ Done in v0.1 step 5; **removed in step 6a** when `WsolaSpeed` replaced it. Used `rubato::SincFixedIn` with chunk = 1024 and `max_resample_ratio_relative = 4.0`. Speed slider worked but pitch was coupled to speed (turntable). Step 6b reintroduced a `rubato::SincFixedIn` *inside the WSOLA composite* (`WsolaPitchShift`) — same crate, no longer standalone.
 3. **Phase 3 — WSOLA + resample** (`dsp/wsola.rs`). Time-domain WSOLA for time-stretch — pure-Rust, low-latency. Cascade with `rubato` for pitch shift. This is the MVP target. **Subdivided into v0.1 steps 6a and 6b plus a v0.2 quality pass 6c — see plan below.** ✅ 6a done (`WsolaSpeed`); ✅ 6b done — `WsolaPitchShift` composite drives the engine, and the pitch slider is live in `ui::transport`; ✅ 6c done — AMDF + mono-mix similarity search, unity-gain OLA, and ramped stretch transitions.
-4. **Phase 4 — Phase vocoder** (optional). If WSOLA quality isn't enough on harmonic material, add an FFT-based phase vocoder behind the same trait.
+4. **Phase 4 — Phase vocoder** (`dsp/phase_vocoder.rs`, queued for v0.2). FFT-based time-stretch behind the same `TimePitchProcessor` trait, cascaded with `rubato` for pitch shift (mirrors `WsolaPitchShift`'s shape). Lives alongside WSOLA, not as a replacement: the user picks which engine drives a given track via a UI selector. **Subdivided into steps 8a (vanilla PV + selector) and 8b (refinements: Laroche–Dolson phase locking and transient-detect-and-passthrough) — see plan below.**
 5. **Phase 5 — FFI** (optional, license-permitting). Rubber Band or SoundTouch as opt-in features for top-tier quality.
 
-The `TimePitchProcessor` trait keeps the engine ignorant of which phase we're in.
+The `TimePitchProcessor` trait keeps the engine ignorant of which phase we're in. From step 8a onward, the engine *also* doesn't know which DSP family is active — that's chosen at construction time in `make_dsp` from a runtime `DspKind` enum.
 
 ### Step 6 plan (Phase 3, subdivided)
 
@@ -182,6 +182,56 @@ Three independent fixes, all in `dsp/wsola.rs`:
 Plumbing: WSOLA's `effective_stretch()` returns `max(stretch, target_stretch)`. `WsolaSpeed::expected_output_frames_per_chunk` and `WsolaPitchShift::expected_output_frames_per_chunk` use it so a ramp-down (target < current) doesn't under-reserve ring vacancy and silently drop samples through `push_slice`. `WsolaPitchShift::process` uses `target_stretch` as the synth target (rather than the lagging current) so the resampler doesn't starve mid-transition.
 
 Detour clause unchanged: if 6c isn't enough on harmonic material, the trait shape supports a drop-in replacement with Phase 4 (FFT phase vocoder).
+
+### Step 8a plan — Vanilla phase vocoder + DSP selector (queued, v0.2)
+
+The motivation: WSOLA's local cross-frame heuristic preserves waveform shape but can't keep every partial of a sustained tone phase-coherent across frames. A phase vocoder (PV) does that explicitly — it advances every FFT bin by `ω_true · H_synth` where `ω_true` is the bin's measured instantaneous frequency. The result is cleaner pitch-up on vocals / strings / sustained synths. The trade is transient smearing (each bin runs an independent phase trajectory, so the cross-bin alignment that gives a drum hit its "snap" is lost) and ~10× the CPU. Step 8b addresses transient smearing; this step ships the vanilla PV side-by-side with WSOLA so we can compare them directly on real material.
+
+**New module: `dsp/phase_vocoder.rs`**
+
+- `PhaseVocoder` — streaming PV processor analogous to `Wsola`. Frame size 2048, analysis hop varies with stretch, synthesis hop 512, Hann window (same shape and unity-gain compensation as WSOLA so swapping one for the other doesn't change loudness). Per-channel state in lock-step like `Wsola` so a single set of true-frequency estimates drives all channels and stereo image stays coherent.
+- `PhaseVocoderPitchShift` — composite `TimePitchProcessor` that owns a `PhaseVocoder` and a `rubato::SincFixedIn` plumbed back-to-back, identical math to `WsolaPitchShift::recompute` (`stretch = pitch_factor / speed` → PV; `ratio = 1 / pitch_factor` → rubato; net composite = `1/speed`). Doing pitch in the spectral domain is a Phase 5 / future-PV-iteration concern; for now the cascade keeps the structure parallel to WSOLA so the comparison is apples-to-apples.
+- `PhaseVocoderSpeed` — speed-only fallback used when rubato can't be constructed for the channel count, mirroring the `WsolaSpeed` fallback.
+
+**Algorithm sketch (per synthesis step)**:
+1. Window the analysis frame and FFT it (real-input, so `realfft` is a fit — half the work of a complex FFT).
+2. For each bin `k`: compute `Δφ = phase[k] - prev_phase[k]`; subtract the nominal advance `ω_k · H_a`; wrap to `[-π, π]`; convert to `ω_true[k] = ω_k + (Δφ_wrapped / H_a)`.
+3. Accumulate output phase: `out_phase[k] += ω_true[k] · H_s`.
+4. Build the synthesis spectrum `magnitude[k] · exp(i · out_phase[k])`; IFFT.
+5. Window the output frame again (analysis × synthesis windowing — standard for PV; helps suppress spectral leakage at the synthesis side).
+6. Overlap-add at synthesis hop 512 into the per-channel output queue, just like WSOLA's OLA stage.
+
+State that survives across calls: `prev_phase[ch][k]`, `out_phase[ch][k]`, the OLA tail, the input/output queues.
+
+**Stretch ramping**: PV inherits the same `target_stretch` / `STRETCH_RAMP_PER_STEP` discipline from WSOLA — `analysis_hop` shouldn't snap mid-playback. PV is more sensitive to `H_a` jumps than WSOLA because the phase advance formula is keyed to `H_a`; ramping is essential, not just nice-to-have.
+
+**Crate dependency**: `realfft` (built on `rustfft`). Pure-Rust, dependency-light, well-suited to streaming use. Per-frame FFT/IFFT cost on a 2048-point real transform is on the order of tens of microseconds; at 23 ms chunks even 4 transforms per chunk is a fraction of a percent of the audio thread budget.
+
+**DSP selector — wiring**:
+- New `pub enum DspKind { Wsola, PhaseVocoder }` (likely in `dsp/mod.rs`). Default `Wsola` for backwards compatibility (existing sessions don't carry a kind).
+- New `Command::SetDsp(DspKind)`. Engine on receipt: drop the current `Box<dyn TimePitchProcessor>`, build a new one for the current channel count and carry the current speed/pitch across. Same code path as the existing channel-count-based recreation in `LoadTrack`, factored slightly.
+- `make_dsp` in `engine/worker.rs` gains a `kind: DspKind` parameter and dispatches to the WSOLA family or the PV family. Each family has its own fallback chain — e.g. PV: `PhaseVocoderPitchShift` → `PhaseVocoderSpeed` → `Passthrough`.
+- App owns the chosen `DspKind` (UI source of truth, like the loop region) and re-sends `Command::SetDsp` after `LoadTrack` if needed. Survives across track loads.
+- Selector UI: a small radio group or dropdown in `ui::transport`, near the speed/pitch sliders. Label: "Stretch engine". Tooltip explains the trade ("WSOLA: cleaner transients. Phase vocoder: cleaner sustained tones").
+
+**Session schema**: bump to `version: 2`, add `dsp_kind: "wsola" | "phase_vocoder"` (default `wsola` if absent — preserves v1 sessions). Migration is straightforward; the loader treats absent kind as `wsola`.
+
+**Risks**:
+- Transient smearing on percussive material is expected for vanilla PV. Don't be alarmed when it shows up — that's exactly what step 8b targets.
+- PV is more sensitive than WSOLA to FP noise in the phase accumulation when `H_a` ramps; if drift becomes audible during long ramps, periodically re-anchor `out_phase[k]` to the current frame's measured phase at synthesis-step boundaries.
+- A/B comparison ergonomics matter: changing kind during playback should be smooth, not click-and-pop. Practical fix: on `SetDsp`, briefly cross-fade the ring contents or restart the stream. Defer until we hear how bad the unmitigated switch is.
+
+### Step 8b plan — PV refinements (queued, v0.2 follow-up)
+
+Two independent improvements; ship in either order based on which the audible testing of 8a shows is more painful:
+
+1. **Transient detection + passthrough.** Per analysis frame, compute a transient indicator (spectral flux — `Σ max(0, |X[k]| − |X_prev[k]|)` — or high-frequency energy spike, or both). When the indicator exceeds a threshold, *skip phase advancement for that frame*: copy the analysis phase straight to the synthesis phase. The result is a windowed copy of the original frame at its native phase, OLA'd into the output. Drum hits and pluck attacks recover their snap; sustained material is unaffected. Threshold and hysteresis are the only knobs; pick conservative defaults and expose nothing in the UI yet. Cheapest of the two refinements; biggest single audible win on percussive content.
+
+2. **Laroche–Dolson phase locking.** After computing the synthesis phase per bin, identify spectral peaks (local magnitude maxima with a small neighbourhood). For each non-peak bin, replace its synthesis phase with the nearest peak's synthesis phase plus the analysis-time relative phase to that peak. This keeps the harmonics of a single source phase-coherent across frames, eliminating the residual "phasiness" / "warble" that vanilla PV leaves on sustained tones. Adds a peak-detect pass per frame and a phase-rewrite pass — still cheap, but more code than transient detection.
+
+Both changes are local to `phase_vocoder.rs` — neither touches the trait or the engine. The selector remains a binary `DspKind` (we're not exposing "vanilla PV" vs "phase-locked PV" as separate options; phase locking is the canonical PV behaviour after 8b).
+
+**Detour clause**: if 8a + 8b still don't satisfy on a particular kind of material, Phase 5 (FFI to Rubber Band or signalsmith-stretch) is the escape hatch. The trait shape doesn't need to change — we'd add another `DspKind` variant that wraps the FFI library.
 
 ## Why a custom mixer instead of `rodio`
 
@@ -233,4 +283,4 @@ Versioned from day one so we can migrate without breaking saved sessions.
 
 - **Ring flush on seek**: ringbuf has no producer-side flush, so after a `Seek` the ~85 ms of audio already in the ring still plays before the new position is heard. Acceptable today but if it becomes annoying we'll need an epoch protocol (callback drops samples it sees as stale) or a stream-restart trick. For now, keep the ring small.
 - **Seek-while-playing slider jitter**: the seek slider re-binds to the engine's `position` every frame, so dragging while playing produces visible micro-stepping (pointer says X, next frame engine says X+Δ). Plan: when the slider response reports `dragged()`, freeze the displayed value to the user's pointer until release. Cheap fix, deferred to v0.2.
-- **Phase vocoder crate**: survey current ecosystem at the start of Phase 4. Candidates: `phase-vocoder`, `signalsmith-stretch` bindings (if they exist), or roll our own.
+- **Phase vocoder crate** (resolved in step 8a plan): rolling our own on top of `realfft` (built on `rustfft`). Pure-Rust, dependency-light, real-input optimisation halves the FFT cost. Existing PV crates (`phase-vocoder` etc.) were too monolithic to fit our streaming chunk-based engine. `signalsmith-stretch` is reserved for Phase 5 (FFI escape hatch).

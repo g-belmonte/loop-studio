@@ -23,7 +23,7 @@ v0.1 (MVP) shipped: every checkbox below in the v0.1 list is implemented. Active
 | Audio output   | `cpal`                              | Low-level cross-platform output; we control the callback. |
 | Decoding       | `symphonia`                         | Pure-Rust, broad format support, stream-friendly. |
 | Resampling     | `rubato`                            | High-quality sample-rate conversion, used as a DSP building block. |
-| Time/pitch DSP | In-house WSOLA + `rubato`           | WSOLA stretches in time, `rubato` shifts pitch; behind a trait so we can swap to a phase vocoder later. See [ARCHITECTURE.md](./ARCHITECTURE.md#dsp). |
+| Time/pitch DSP | In-house WSOLA + `rubato` (PV next)  | WSOLA stretches in time, `rubato` shifts pitch; behind a trait so an FFT-based phase vocoder can ship alongside (step 8a) and the user picks per track. See [ARCHITECTURE.md](./ARCHITECTURE.md#dsp). |
 | Ring buffer    | `ringbuf`                           | Lock-free SPSC, real-time-safe. |
 | File dialog    | `rfd`                               | Native open/save dialogs. |
 | Sessions       | `serde` + `serde_json`              | Simple, human-readable. |
@@ -50,6 +50,8 @@ See [ARCHITECTURE.md](./ARCHITECTURE.md) for thread layout, data flow, and modul
 - [ ] Zoom + scroll on waveform.
 - [ ] Cents-level pitch nudge.
 - [x] WSOLA quality pass: AMDF similarity search, OLA gain compensation, stretch ramping (see [ARCHITECTURE.md step 6c](./ARCHITECTURE.md#step-6c--wsola-quality-pass--done)).
+- [ ] **Phase vocoder time-stretch** with WSOLA / PV runtime selector (see [ARCHITECTURE.md step 8a](./ARCHITECTURE.md#step-8a-plan--vanilla-phase-vocoder--dsp-selector-queued-v02)). Trade-off: PV is cleaner on sustained tones, WSOLA is cleaner on transients — pick per track.
+- [ ] PV refinements: Laroche–Dolson phase locking and transient-detect-and-passthrough (see [ARCHITECTURE.md step 8b](./ARCHITECTURE.md#step-8b-plan--pv-refinements-queued-v02-follow-up)). Closes the transient-smear gap that vanilla PV leaves.
 
 ### v0.3 — Practice features
 

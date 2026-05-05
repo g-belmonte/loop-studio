@@ -10,17 +10,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Next planned work
 
-v0.1 is closed and the first v0.2 thread (step 6c — WSOLA quality pass) is in: AMDF similarity search over a sum-of-channels mono mix, unity-gain OLA, and ramped stretch transitions. Audible verification of 6c is still owed — exercise pitch-up on solo voice or sustained tones, drag both sliders during playback to confirm the clicks are gone. If quality isn't there, the detour clause stands: jump to Phase 4 (FFT phase vocoder).
+v0.1 is closed and the first v0.2 thread (step 6c — WSOLA quality pass) is in: AMDF similarity search over a sum-of-channels mono mix, unity-gain OLA, and ramped stretch transitions. Audible verification of 6c is still owed — exercise pitch-up on solo voice or sustained tones, drag both sliders during playback to confirm the clicks are gone.
 
 What's queued for the rest of v0.2:
 
+- **Step 8a — Phase vocoder + DSP selector.** New `dsp/phase_vocoder.rs` (FFT-based time-stretch behind the same `TimePitchProcessor` trait, cascaded with rubato for pitch — same shape as `WsolaPitchShift`). Lives *alongside* WSOLA, not as a replacement; a UI selector lets the user pick per track. New `DspKind` enum, new `Command::SetDsp`, `make_dsp` dispatches per kind. Session schema bumps to v2 to persist the kind. Full plan in `ARCHITECTURE.md` "Step 8a plan". Risk: vanilla PV smears transients — that's expected and is what step 8b targets.
+- **Step 8b — PV refinements.** Transient-detect-and-passthrough (skip phase advancement on percussive frames so drum hits keep their snap) and Laroche–Dolson phase locking (lock non-peak bin phases to nearby spectral peaks so harmonics stay coherent across frames). Either independently is shippable; ship in whichever order audible 8a testing demands. Both are local to `phase_vocoder.rs` — neither touches the trait or the engine.
 - Keyboard shortcuts (space, arrows, `[`/`]` for loop points).
 - Markers / cue points.
 - Per-track session auto-save.
 - Waveform zoom + scroll.
 - Cents-level pitch nudge.
 
-Ask the user which thread they want before starting — the order isn't determined.
+Ask the user which thread they want before starting — the order isn't determined. Detour clause for 8a/8b: if neither closes the gap on a particular kind of material, Phase 5 (FFI to Rubber Band or signalsmith-stretch) is the escape hatch — the trait shape stays the same.
 
 ## Commands
 
@@ -71,6 +73,7 @@ App (GUI thread) ──spawns std::thread──► Load-time worker (decode + pe
 - `wsola.rs` — `Wsola` (streaming WSOLA, frame 2048 / hop 512 / search ±256 / Hann, AMDF similarity search over a sum-of-channels mono mix, unity-gain OLA via window/COLA-sum compensation, ramped stretch via `target_stretch`/`STRETCH_RAMP_PER_STEP` — see step 6c), plus two `TimePitchProcessor` adapters: `WsolaSpeed` (speed-only, used as fallback when the rubato resampler in the composite can't be constructed) and `WsolaPitchShift` (the active path — composite that cascades `Wsola` with `rubato::SincFixedIn` chunk = 1024, `max_resample_ratio_relative = 4.0`). `WsolaPitchShift::recompute` enforces the cascade math: `stretch = 2^(p/12) / speed` for WSOLA, `ratio = 1 / 2^(p/12)` for rubato, net composite ratio = `1/speed`.
 
   `Wsola::effective_stretch()` (the larger of current and target) is what both adapters report through `expected_output_frames_per_chunk` so a ramp-down doesn't under-reserve ring vacancy and silently drop samples in `push_slice`.
+- `phase_vocoder.rs` — *queued for v0.2 step 8a, not yet implemented.* FFT-based time-stretch behind the same trait, cascaded with rubato for pitch (same composite shape as `WsolaPitchShift`). Will live alongside WSOLA, not as a replacement — runtime selectable via a new `DspKind` enum and `Command::SetDsp`. See `ARCHITECTURE.md` "Step 8a plan" / "Step 8b plan".
 
 When you change the DSP plan, edit the "DSP" section of `ARCHITECTURE.md` so the staged phases stay accurate.
 
