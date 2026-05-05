@@ -10,7 +10,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Next planned work
 
-The next checkbox is **pitch shift via WSOLA**, subdivided into two sub-steps. **Read the "Step 6 plan" section of `ARCHITECTURE.md`** before starting — it has the algorithm parameters to start with, the exact stretch/resample math, the chunk-boundary risks, and the detour clause if WSOLA quality turns out unacceptable. Brief: 6a replaces `ResampleSpeed` with a WSOLA-based speed processor (speed slider preserves pitch, no pitch slider yet); 6b adds the pitch-shift cascade and the slider UI.
+Step 6 is fully shipped: `WsolaPitchShift` runs in the engine and both speed and pitch sliders are live in `ui::transport`. **Next checkbox**: session save/load (JSON: path, loop, speed, pitch, last position). The skeleton already exists in `src/session/` (`Session` struct, currently unused — that's the dead-code warning) and the loop region is in `App`, so most of the wiring is reading/writing fields rather than new architecture. After that, v0.1 closes and we move to v0.2 (keyboard shortcuts, markers, zoom).
 
 ## Commands
 
@@ -55,11 +55,10 @@ App (GUI thread) ──spawns std::thread──► Load-time worker (decode + pe
 
 ## DSP staging
 
-`TimePitchProcessor` (in `src/dsp/mod.rs`) abstracts time-stretch + pitch-shift. The engine is chunk-aware: it queries `input_frames_per_chunk()`, `max_output_frames_per_chunk()` (for scratch sizing), and `expected_output_frames_per_chunk()` (for ring-vacancy checking — using max here would deadlock at large `max_resample_ratio_relative`). Implementations live in `src/dsp/`:
+`TimePitchProcessor` (in `src/dsp/mod.rs`) abstracts time-stretch + pitch-shift. The engine is chunk-aware: it queries `input_frames_per_chunk()`, `max_output_frames_per_chunk()` (for scratch sizing), and `expected_output_frames_per_chunk()` (for ring-vacancy checking — returning the max here would deadlock when the worst-case output far exceeds the steady-state output). Implementations live in `src/dsp/`:
 
-- `passthrough.rs` — identity, fallback when the resampler can't be constructed.
-- `resample.rs` — `rubato::SincFixedIn`, chunk = 1024 frames, `max_resample_ratio_relative = 4.0`. **Speed-coupled**: changes pitch with speed (turntable behaviour).
-- `wsola.rs` — empty stub; the upcoming MVP target. Will time-stretch independently of pitch and let the resampler handle pitch shift.
+- `passthrough.rs` — identity, ultimate fallback (degenerate channel count).
+- `wsola.rs` — `Wsola` (streaming WSOLA, frame 2048 / hop 512 / search ±256 / Hann), plus two `TimePitchProcessor` adapters: `WsolaSpeed` (speed-only, used as fallback when the rubato resampler in the composite can't be constructed) and `WsolaPitchShift` (the active path — composite that cascades `Wsola` with `rubato::SincFixedIn` chunk = 1024, `max_resample_ratio_relative = 4.0`). `WsolaPitchShift::recompute` enforces the cascade math: `stretch = 2^(p/12) / speed` for WSOLA, `ratio = 1 / 2^(p/12)` for rubato, net composite ratio = `1/speed`.
 
 When you change the DSP plan, edit the "DSP" section of `ARCHITECTURE.md` so the staged phases stay accurate.
 

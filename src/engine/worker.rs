@@ -8,7 +8,7 @@ use ringbuf::traits::{Observer, Producer};
 use crate::audio::output::{self, ActiveOutput};
 use crate::dsp::TimePitchProcessor;
 use crate::dsp::passthrough::Passthrough;
-use crate::dsp::resample::ResampleSpeed;
+use crate::dsp::wsola::{WsolaPitchShift, WsolaSpeed};
 use crate::engine::Command;
 use crate::engine::state::SharedState;
 use crate::track::{LoopRegion, Track};
@@ -136,11 +136,13 @@ fn apply(
                 }
             }
 
-            // Recreate DSP if channel count changed (rubato is per-channel-count).
-            // Carry the current speed setting over so the slider stays meaningful.
+            // Recreate DSP if channel count changed (per-channel-count state in
+            // both WSOLA buffers and the rubato resampler). Carry the current
+            // speed and pitch so the sliders stay meaningful across loads.
             if *current_channels != Some(new_track.channels) {
                 let carried_speed = f32::from_bits(state.speed_bits.load(Ordering::Relaxed));
-                *dsp = make_dsp(new_track.channels as usize, carried_speed);
+                let carried_pitch = f32::from_bits(state.pitch_bits.load(Ordering::Relaxed));
+                *dsp = make_dsp(new_track.channels as usize, carried_speed, carried_pitch);
                 *current_channels = Some(new_track.channels);
                 let needed = dsp.max_output_frames_per_chunk() * new_track.channels as usize;
                 if scratch.len() < needed {
@@ -304,19 +306,33 @@ fn produce(
     state.position.store(*cursor, Ordering::Relaxed);
 }
 
-/// Build the DSP for a track. Falls back to passthrough (no speed control)
-/// if the resampler can't be constructed for the given channel count.
-fn make_dsp(channels: usize, current_speed: f32) -> Box<dyn TimePitchProcessor> {
-    match ResampleSpeed::new(channels) {
-        Ok(mut r) => {
-            r.set_speed(current_speed);
-            Box::new(r)
+/// Build the DSP for a track. Tries the full WSOLA + rubato cascade
+/// (`WsolaPitchShift`) first; if rubato can't be constructed for this channel
+/// count, falls back to `WsolaSpeed` (speed slider still works, pitch slider
+/// becomes a no-op); ultimate fallback is `Passthrough`.
+fn make_dsp(
+    channels: usize,
+    current_speed: f32,
+    current_pitch: f32,
+) -> Box<dyn TimePitchProcessor> {
+    if channels == 0 {
+        log::error!("track has 0 channels; using passthrough");
+        return Box::new(Passthrough::new());
+    }
+    match WsolaPitchShift::new(channels) {
+        Ok(mut p) => {
+            p.set_speed(current_speed);
+            p.set_pitch_semitones(current_pitch);
+            Box::new(p)
         }
         Err(e) => {
             log::error!(
-                "resampler failed for {channels} ch: {e:#}; using passthrough (no speed control)"
+                "pitch-shift composite failed for {channels} ch: {e:#}; \
+                 falling back to WsolaSpeed (no pitch shift)"
             );
-            Box::new(Passthrough::new())
+            let mut w = WsolaSpeed::new(channels);
+            w.set_speed(current_speed);
+            Box::new(w)
         }
     }
 }

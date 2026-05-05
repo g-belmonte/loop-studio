@@ -59,6 +59,25 @@ pub fn show(ui: &mut egui::Ui, engine: &Engine, sample_rate: u32, total_frames: 
         }
     });
 
+    // Pitch control. Linear in semitones — equal perceptual steps.
+    let mut pitch = f32::from_bits(state.pitch_bits.load(Ordering::Relaxed));
+    if !pitch.is_finite() {
+        pitch = 0.0;
+    }
+    ui.horizontal(|ui| {
+        let r = ui.add(
+            egui::Slider::new(&mut pitch, -12.0..=12.0)
+                .suffix(" st")
+                .text("pitch"),
+        );
+        if r.changed() {
+            engine.send(Command::SetPitch(pitch));
+        }
+        if ui.button("0 st").clicked() {
+            engine.send(Command::SetPitch(0.0));
+        }
+    });
+
     dragging
 }
 

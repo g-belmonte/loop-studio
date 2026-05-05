@@ -1,5 +1,4 @@
 pub mod passthrough;
-pub mod resample;
 pub mod wsola;
 
 /// Time-stretch and/or pitch-shift on interleaved f32 samples.
