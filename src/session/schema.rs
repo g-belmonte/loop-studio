@@ -1,5 +1,6 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::track::LoopRegion;
@@ -13,4 +14,30 @@ pub struct Session {
     pub speed: f32,
     pub pitch_semitones: f32,
     pub last_position: u64,
+}
+
+impl Session {
+    pub const CURRENT_VERSION: u32 = 1;
+
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let json = serde_json::to_string_pretty(self).context("serialising session")?;
+        std::fs::write(path, json)
+            .with_context(|| format!("writing session to {}", path.display()))?;
+        Ok(())
+    }
+
+    pub fn load(path: &Path) -> Result<Self> {
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("reading session from {}", path.display()))?;
+        let session: Session =
+            serde_json::from_slice(&bytes).context("parsing session JSON")?;
+        if session.version != Self::CURRENT_VERSION {
+            bail!(
+                "unsupported session version {} (expected {})",
+                session.version,
+                Self::CURRENT_VERSION
+            );
+        }
+        Ok(session)
+    }
 }

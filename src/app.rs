@@ -9,6 +9,7 @@ use eframe::CreationContext;
 
 use crate::audio::decoder;
 use crate::engine::{Command, Engine};
+use crate::session::Session;
 use crate::track::peaks::TrackPeaks;
 use crate::track::{LoopRegion, Track};
 use crate::ui::waveform::WaveformAction;
@@ -33,12 +34,25 @@ struct LoadResult {
     result: anyhow::Result<(Arc<Track>, Arc<TrackPeaks>)>,
 }
 
+/// State to apply *after* an in-flight decode finishes, when the user opened
+/// a session rather than a bare audio file. Held on the GUI thread; consumed
+/// by `drain_decode_results` once the matching `LoadResult` lands.
+struct PendingRestore {
+    path: PathBuf,
+    loop_region: Option<LoopRegion>,
+    speed: f32,
+    pitch_semitones: f32,
+    last_position: u64,
+}
+
 pub struct App {
     status: LoadStatus,
     load_tx: Sender<LoadResult>,
     load_rx: Receiver<LoadResult>,
     engine: Option<Engine>,
     loop_region: Option<LoopRegion>,
+    pending_restore: Option<PendingRestore>,
+    session_error: Option<String>,
 }
 
 impl App {
@@ -57,6 +71,8 @@ impl App {
             load_rx,
             engine,
             loop_region: None,
+            pending_restore: None,
+            session_error: None,
         }
     }
 
@@ -94,14 +110,42 @@ impl App {
                                 track.frame_count(),
                                 peaks.len(),
                             );
-                            self.loop_region = None;
+
+                            // Default: clear the loop region. Overridden below
+                            // if a pending session restore matches this path.
+                            let mut new_loop = None;
+
                             if let Some(engine) = &self.engine {
                                 engine.send(Command::LoadTrack(track.clone()));
                             }
+
+                            if let Some(pending) = self.pending_restore.take() {
+                                if pending.path == path {
+                                    let total = track.frame_count();
+                                    new_loop = clamp_loop(pending.loop_region, total);
+                                    let last_pos = pending.last_position.min(total);
+                                    if let Some(engine) = &self.engine {
+                                        engine.send(Command::SetSpeed(pending.speed));
+                                        engine.send(Command::SetPitch(
+                                            pending.pitch_semitones,
+                                        ));
+                                        engine.send(Command::SetLoop(new_loop));
+                                        engine.send(Command::Seek(last_pos));
+                                    }
+                                }
+                                // else: a different file landed first — discard.
+                            }
+
+                            self.loop_region = new_loop;
                             LoadStatus::Loaded { path, track, peaks }
                         }
                         Err(e) => {
                             log::warn!("failed to load {}: {e:#}", path.display());
+                            // A pending session restore for this path won't ever
+                            // resolve — drop it so a later open doesn't pick it up.
+                            if matches!(&self.pending_restore, Some(p) if p.path == path) {
+                                self.pending_restore = None;
+                            }
                             LoadStatus::Failed {
                                 path,
                                 error: format!("{e:#}"),
@@ -113,6 +157,89 @@ impl App {
             }
         }
     }
+
+    fn save_session(&mut self) {
+        let LoadStatus::Loaded {
+            path: track_path,
+            track,
+            ..
+        } = &self.status
+        else {
+            return;
+        };
+        let Some(engine) = &self.engine else { return };
+
+        let default_name = track_path
+            .file_stem()
+            .map(|s| format!("{}.session.json", s.to_string_lossy()))
+            .unwrap_or_else(|| "session.json".into());
+        let default_dir = track_path.parent();
+
+        let Some(save_path) = menu::pick_session_save(&default_name, default_dir) else {
+            return;
+        };
+
+        let state = engine.state();
+        let session = Session {
+            version: Session::CURRENT_VERSION,
+            track_path: track_path.clone(),
+            track_sample_rate: track.sample_rate,
+            loop_region: self.loop_region,
+            speed: f32::from_bits(state.speed_bits.load(Ordering::Relaxed)),
+            pitch_semitones: f32::from_bits(state.pitch_bits.load(Ordering::Relaxed)),
+            last_position: state.position.load(Ordering::Relaxed),
+        };
+
+        match session.save(&save_path) {
+            Ok(()) => {
+                log::info!("saved session to {}", save_path.display());
+                self.session_error = None;
+            }
+            Err(e) => {
+                log::warn!("failed to save session: {e:#}");
+                self.session_error = Some(format!("Save failed: {e:#}"));
+            }
+        }
+    }
+
+    fn load_session(&mut self, ctx: &egui::Context) {
+        let Some(json_path) = menu::pick_session_open() else {
+            return;
+        };
+
+        let session = match Session::load(&json_path) {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("failed to load session from {}: {e:#}", json_path.display());
+                self.session_error = Some(format!("Load failed: {e:#}"));
+                return;
+            }
+        };
+
+        self.session_error = None;
+        self.pending_restore = Some(PendingRestore {
+            path: session.track_path.clone(),
+            loop_region: session.loop_region,
+            speed: session.speed,
+            pitch_semitones: session.pitch_semitones,
+            last_position: session.last_position,
+        });
+        self.spawn_decode(session.track_path, ctx.clone());
+    }
+}
+
+/// Clamp a saved loop region to the loaded track. Drops the loop if the
+/// region is degenerate (start ≥ end after clamp) or starts past end-of-track.
+fn clamp_loop(region: Option<LoopRegion>, total_frames: u64) -> Option<LoopRegion> {
+    let r = region?;
+    if r.start >= total_frames {
+        return None;
+    }
+    let end = r.end.min(total_frames);
+    if r.start >= end {
+        return None;
+    }
+    Some(LoopRegion { start: r.start, end })
 }
 
 impl eframe::App for App {
@@ -138,6 +265,19 @@ impl eframe::App for App {
                         ui.close_menu();
                         self.open_dialog(ctx);
                     }
+                    ui.separator();
+                    let track_loaded = matches!(self.status, LoadStatus::Loaded { .. });
+                    if ui
+                        .add_enabled(track_loaded, egui::Button::new("Save Session…"))
+                        .clicked()
+                    {
+                        ui.close_menu();
+                        self.save_session();
+                    }
+                    if ui.button("Load Session…").clicked() {
+                        ui.close_menu();
+                        self.load_session(ctx);
+                    }
                 });
             });
         });
@@ -145,6 +285,11 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Loop Studio");
             ui.separator();
+
+            if let Some(err) = &self.session_error {
+                ui.colored_label(egui::Color32::LIGHT_RED, err);
+                ui.add_space(4.0);
+            }
 
             match &self.status {
                 LoadStatus::Idle => {

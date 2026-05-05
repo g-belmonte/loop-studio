@@ -6,11 +6,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `ARCHITECTURE.md` is the source of truth for the threading model, the engine ↔ DSP contract, and every non-obvious design decision (each one carries a "decided v0.1 step N" tag and the reasoning behind it). When you change behaviour that contradicts something in there — update both the code and the doc in the same change.
 
-`README.md` tracks the v0.1 roadmap as a checkbox list. Tick the box in the same change that implements the item.
+`README.md` tracks the roadmap as a checkbox list (v0.1 is closed; new work lands in v0.2). Tick the box in the same change that implements the item.
 
 ## Next planned work
 
-Step 6 is fully shipped: `WsolaPitchShift` runs in the engine and both speed and pitch sliders are live in `ui::transport`. **Next checkbox**: session save/load (JSON: path, loop, speed, pitch, last position). The skeleton already exists in `src/session/` (`Session` struct, currently unused — that's the dead-code warning) and the loop region is in `App`, so most of the wiring is reading/writing fields rather than new architecture. After that, v0.1 closes and we move to v0.2 (keyboard shortcuts, markers, zoom).
+v0.1 is closed: every checkbox in the v0.1 roadmap is ticked (open file, transport, waveform, A/B loop, speed slider, pitch slider, session save/load). What's queued:
+
+- **Step 6c — WSOLA quality pass** (v0.2-tagged but doable any time). Audible testing surfaced pitch-up distortion and clicks at non-default settings. Three targeted fixes: switch the similarity search from raw cross-correlation to AMDF; compensate the OLA gain (Hann at hop=N/4 has COLA ≈ 1.75, so output is ~5 dB hot); ramp WSOLA's stretch factor so it matches rubato's already-ramped ratio. Full plan in `ARCHITECTURE.md` "Step 6c plan". Detour clause: if 6c isn't enough, jump to Phase 4 (FFT phase vocoder).
+- **The rest of v0.2** — keyboard shortcuts, markers, per-track session auto-save, waveform zoom, cents-level pitch nudge.
+
+Ask the user which thread they want before starting — the order isn't determined.
 
 ## Commands
 

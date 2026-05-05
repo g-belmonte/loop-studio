@@ -13,7 +13,7 @@ A practice-focused music player for musicians who learn by ear. Open a track, ma
 
 ## Status
 
-Pre-MVP. The repo currently contains the architecture, a `Cargo.toml` with the chosen stack, and module skeletons. Nothing audible yet.
+v0.1 (MVP) shipped: every checkbox below in the v0.1 list is implemented. Active work is moving to v0.2 — the next thread on deck is the WSOLA quality pass (see `ARCHITECTURE.md` step 6c).
 
 ## Tech stack
 
@@ -23,7 +23,7 @@ Pre-MVP. The repo currently contains the architecture, a `Cargo.toml` with the c
 | Audio output   | `cpal`                              | Low-level cross-platform output; we control the callback. |
 | Decoding       | `symphonia`                         | Pure-Rust, broad format support, stream-friendly. |
 | Resampling     | `rubato`                            | High-quality sample-rate conversion, used as a DSP building block. |
-| Time/pitch DSP | TBD — pure-Rust phase vocoder/WSOLA | Pluggable; see [ARCHITECTURE.md](./ARCHITECTURE.md#dsp). |
+| Time/pitch DSP | In-house WSOLA + `rubato`           | WSOLA stretches in time, `rubato` shifts pitch; behind a trait so we can swap to a phase vocoder later. See [ARCHITECTURE.md](./ARCHITECTURE.md#dsp). |
 | Ring buffer    | `ringbuf`                           | Lock-free SPSC, real-time-safe. |
 | File dialog    | `rfd`                               | Native open/save dialogs. |
 | Sessions       | `serde` + `serde_json`              | Simple, human-readable. |
@@ -40,7 +40,7 @@ See [ARCHITECTURE.md](./ARCHITECTURE.md) for thread layout, data flow, and modul
 - [x] **A/B loop**: click waveform to set start/end; seamless loop playback.
 - [x] **Speed slider** 0.25× – 2.0× (real-time, pitch-preserving via WSOLA after step 6a).
 - [x] **Pitch slider** ±12 semitones (real-time, independent of speed).
-- [ ] **Session save/load** (JSON: path, loop, speed, pitch, last position).
+- [x] **Session save/load** (JSON: path, loop, speed, pitch, last position).
 
 ### v0.2 — Quality of life
 
@@ -49,6 +49,7 @@ See [ARCHITECTURE.md](./ARCHITECTURE.md) for thread layout, data flow, and modul
 - [ ] Per-track session auto-save.
 - [ ] Zoom + scroll on waveform.
 - [ ] Cents-level pitch nudge.
+- [ ] WSOLA quality pass: AMDF similarity search, OLA gain compensation, stretch ramping (see [ARCHITECTURE.md step 6c](./ARCHITECTURE.md#step-6c-plan--wsola-quality-pass-queued)).
 
 ### v0.3 — Practice features
 
