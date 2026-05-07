@@ -6,9 +6,10 @@ use crossbeam_channel::{Receiver, TryRecvError};
 use ringbuf::traits::{Observer, Producer};
 
 use crate::audio::output::{self, ActiveOutput};
-use crate::dsp::TimePitchProcessor;
 use crate::dsp::passthrough::Passthrough;
+use crate::dsp::phase_vocoder::{PhaseVocoderPitchShift, PhaseVocoderSpeed};
 use crate::dsp::wsola::{WsolaPitchShift, WsolaSpeed};
+use crate::dsp::{DspKind, TimePitchProcessor};
 use crate::engine::Command;
 use crate::engine::state::SharedState;
 use crate::track::{LoopRegion, Track};
@@ -26,6 +27,7 @@ pub fn run(rx: Receiver<Command>, state: Arc<SharedState>) {
     let mut output: Option<ActiveOutput> = None;
     let mut dsp: Box<dyn TimePitchProcessor> = Box::new(Passthrough::new());
     let mut current_channels: Option<u16> = None;
+    let mut current_kind: DspKind = DspKind::default();
     let mut scratch: Vec<f32> = Vec::new();
     // Stitching buffer for chunks that straddle a loop boundary. Lazily sized
     // on first wrap; cost is one allocation per playback session.
@@ -41,6 +43,7 @@ pub fn run(rx: Receiver<Command>, state: Arc<SharedState>) {
             &mut output,
             &mut dsp,
             &mut current_channels,
+            &mut current_kind,
             &mut scratch,
             &state,
         );
@@ -82,6 +85,7 @@ fn drain_commands(
     output: &mut Option<ActiveOutput>,
     dsp: &mut Box<dyn TimePitchProcessor>,
     current_channels: &mut Option<u16>,
+    current_kind: &mut DspKind,
     scratch: &mut Vec<f32>,
     state: &SharedState,
 ) -> bool {
@@ -96,6 +100,7 @@ fn drain_commands(
                 output,
                 dsp,
                 current_channels,
+                current_kind,
                 scratch,
                 state,
             ),
@@ -115,6 +120,7 @@ fn apply(
     output: &mut Option<ActiveOutput>,
     dsp: &mut Box<dyn TimePitchProcessor>,
     current_channels: &mut Option<u16>,
+    current_kind: &mut DspKind,
     scratch: &mut Vec<f32>,
     state: &SharedState,
 ) {
@@ -142,7 +148,12 @@ fn apply(
             if *current_channels != Some(new_track.channels) {
                 let carried_speed = f32::from_bits(state.speed_bits.load(Ordering::Relaxed));
                 let carried_pitch = f32::from_bits(state.pitch_bits.load(Ordering::Relaxed));
-                *dsp = make_dsp(new_track.channels as usize, carried_speed, carried_pitch);
+                *dsp = make_dsp(
+                    new_track.channels as usize,
+                    *current_kind,
+                    carried_speed,
+                    carried_pitch,
+                );
                 *current_channels = Some(new_track.channels);
                 let needed = dsp.max_output_frames_per_chunk() * new_track.channels as usize;
                 if scratch.len() < needed {
@@ -200,6 +211,29 @@ fn apply(
             state
                 .pitch_bits
                 .store(semitones.to_bits(), Ordering::Relaxed);
+        }
+        Command::SetDsp(kind) => {
+            // Always remember the requested kind — applied lazily on the next
+            // LoadTrack if no track is loaded yet, or rebuilt now if one is.
+            if *current_kind != kind {
+                *current_kind = kind;
+                if let Some(channels) = *current_channels {
+                    let carried_speed =
+                        f32::from_bits(state.speed_bits.load(Ordering::Relaxed));
+                    let carried_pitch =
+                        f32::from_bits(state.pitch_bits.load(Ordering::Relaxed));
+                    *dsp = make_dsp(
+                        channels as usize,
+                        kind,
+                        carried_speed,
+                        carried_pitch,
+                    );
+                    let needed = dsp.max_output_frames_per_chunk() * channels as usize;
+                    if scratch.len() < needed {
+                        scratch.resize(needed, 0.0);
+                    }
+                }
+            }
         }
     }
 }
@@ -306,12 +340,15 @@ fn produce(
     state.position.store(*cursor, Ordering::Relaxed);
 }
 
-/// Build the DSP for a track. Tries the full WSOLA + rubato cascade
-/// (`WsolaPitchShift`) first; if rubato can't be constructed for this channel
-/// count, falls back to `WsolaSpeed` (speed slider still works, pitch slider
-/// becomes a no-op); ultimate fallback is `Passthrough`.
+/// Build the DSP for a track. The selected `DspKind` picks the family;
+/// within each family, we try the full pitch-shift composite first
+/// (`*PitchShift`), fall back to the speed-only adapter (`*Speed`) if
+/// rubato can't be constructed for this channel count (speed slider still
+/// works, pitch slider becomes a no-op), and ultimately fall back to
+/// `Passthrough` for degenerate channel counts.
 fn make_dsp(
     channels: usize,
+    kind: DspKind,
     current_speed: f32,
     current_pitch: f32,
 ) -> Box<dyn TimePitchProcessor> {
@@ -319,21 +356,39 @@ fn make_dsp(
         log::error!("track has 0 channels; using passthrough");
         return Box::new(Passthrough::new());
     }
-    match WsolaPitchShift::new(channels) {
-        Ok(mut p) => {
-            p.set_speed(current_speed);
-            p.set_pitch_semitones(current_pitch);
-            Box::new(p)
-        }
-        Err(e) => {
-            log::error!(
-                "pitch-shift composite failed for {channels} ch: {e:#}; \
-                 falling back to WsolaSpeed (no pitch shift)"
-            );
-            let mut w = WsolaSpeed::new(channels);
-            w.set_speed(current_speed);
-            Box::new(w)
-        }
+    match kind {
+        DspKind::Wsola => match WsolaPitchShift::new(channels) {
+            Ok(mut p) => {
+                p.set_speed(current_speed);
+                p.set_pitch_semitones(current_pitch);
+                Box::new(p)
+            }
+            Err(e) => {
+                log::error!(
+                    "WsolaPitchShift failed for {channels} ch: {e:#}; \
+                     falling back to WsolaSpeed (no pitch shift)"
+                );
+                let mut w = WsolaSpeed::new(channels);
+                w.set_speed(current_speed);
+                Box::new(w)
+            }
+        },
+        DspKind::PhaseVocoder => match PhaseVocoderPitchShift::new(channels) {
+            Ok(mut p) => {
+                p.set_speed(current_speed);
+                p.set_pitch_semitones(current_pitch);
+                Box::new(p)
+            }
+            Err(e) => {
+                log::error!(
+                    "PhaseVocoderPitchShift failed for {channels} ch: {e:#}; \
+                     falling back to PhaseVocoderSpeed (no pitch shift)"
+                );
+                let mut w = PhaseVocoderSpeed::new(channels);
+                w.set_speed(current_speed);
+                Box::new(w)
+            }
+        },
     }
 }
 

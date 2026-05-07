@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::dsp::DspKind;
 use crate::track::LoopRegion;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,10 +15,15 @@ pub struct Session {
     pub speed: f32,
     pub pitch_semitones: f32,
     pub last_position: u64,
+    /// Stretch-engine selection (added in schema v2). Absent in v1 sessions —
+    /// `#[serde(default)]` falls back to `DspKind::Wsola`, which matches v1's
+    /// only available behaviour.
+    #[serde(default)]
+    pub dsp_kind: DspKind,
 }
 
 impl Session {
-    pub const CURRENT_VERSION: u32 = 1;
+    pub const CURRENT_VERSION: u32 = 2;
 
     pub fn save(&self, path: &Path) -> Result<()> {
         let json = serde_json::to_string_pretty(self).context("serialising session")?;
@@ -31,9 +37,12 @@ impl Session {
             .with_context(|| format!("reading session from {}", path.display()))?;
         let session: Session =
             serde_json::from_slice(&bytes).context("parsing session JSON")?;
-        if session.version != Self::CURRENT_VERSION {
+        // Accept any version we know how to read — v1 (no dsp_kind, defaulted)
+        // or v2. Future versions error out so we don't silently misinterpret
+        // newer fields.
+        if session.version < 1 || session.version > Self::CURRENT_VERSION {
             bail!(
-                "unsupported session version {} (expected {})",
+                "unsupported session version {} (expected 1..={})",
                 session.version,
                 Self::CURRENT_VERSION
             );

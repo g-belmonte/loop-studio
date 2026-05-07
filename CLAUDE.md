@@ -10,11 +10,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Next planned work
 
-v0.1 is closed and the first v0.2 thread (step 6c — WSOLA quality pass) is in: AMDF similarity search over a sum-of-channels mono mix, unity-gain OLA, and ramped stretch transitions. Audible verification of 6c is still owed — exercise pitch-up on solo voice or sustained tones, drag both sliders during playback to confirm the clicks are gone.
+v0.1 is closed and v0.2 is in flight. Done so far: step 6c (WSOLA quality pass — AMDF similarity search over a sum-of-channels mono mix, unity-gain OLA, ramped stretch transitions) and step 8a (phase vocoder + `DspKind` selector — `dsp/phase_vocoder.rs` cascaded with rubato, same composite shape as `WsolaPitchShift`; selector lives in `ui::transport`; session schema bumped to v2). Audible verification of both is still owed — for 6c, exercise pitch-up on solo voice or sustained tones and drag both sliders during playback to confirm clicks are gone; for 8a, A/B WSOLA vs PV on the same material (PV should be cleaner on sustained tones, WSOLA on transients).
 
 What's queued for the rest of v0.2:
 
-- **Step 8a — Phase vocoder + DSP selector.** New `dsp/phase_vocoder.rs` (FFT-based time-stretch behind the same `TimePitchProcessor` trait, cascaded with rubato for pitch — same shape as `WsolaPitchShift`). Lives *alongside* WSOLA, not as a replacement; a UI selector lets the user pick per track. New `DspKind` enum, new `Command::SetDsp`, `make_dsp` dispatches per kind. Session schema bumps to v2 to persist the kind. Full plan in `ARCHITECTURE.md` "Step 8a plan". Risk: vanilla PV smears transients — that's expected and is what step 8b targets.
 - **Step 8b — PV refinements.** Transient-detect-and-passthrough (skip phase advancement on percussive frames so drum hits keep their snap) and Laroche–Dolson phase locking (lock non-peak bin phases to nearby spectral peaks so harmonics stay coherent across frames). Either independently is shippable; ship in whichever order audible 8a testing demands. Both are local to `phase_vocoder.rs` — neither touches the trait or the engine.
 - Keyboard shortcuts (space, arrows, `[`/`]` for loop points).
 - Markers / cue points.

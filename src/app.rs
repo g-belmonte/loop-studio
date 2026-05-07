@@ -8,6 +8,7 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
 use eframe::CreationContext;
 
 use crate::audio::decoder;
+use crate::dsp::DspKind;
 use crate::engine::{Command, Engine};
 use crate::session::Session;
 use crate::track::peaks::TrackPeaks;
@@ -43,6 +44,7 @@ struct PendingRestore {
     speed: f32,
     pitch_semitones: f32,
     last_position: u64,
+    dsp_kind: DspKind,
 }
 
 pub struct App {
@@ -51,6 +53,10 @@ pub struct App {
     load_rx: Receiver<LoadResult>,
     engine: Option<Engine>,
     loop_region: Option<LoopRegion>,
+    /// Currently-selected DSP family (UI source of truth, like `loop_region`).
+    /// Survives across track loads; sent to the engine via `Command::SetDsp`
+    /// on user change or session restore.
+    dsp_kind: DspKind,
     pending_restore: Option<PendingRestore>,
     session_error: Option<String>,
 }
@@ -71,6 +77,7 @@ impl App {
             load_rx,
             engine,
             loop_region: None,
+            dsp_kind: DspKind::default(),
             pending_restore: None,
             session_error: None,
         }
@@ -124,7 +131,11 @@ impl App {
                                     let total = track.frame_count();
                                     new_loop = clamp_loop(pending.loop_region, total);
                                     let last_pos = pending.last_position.min(total);
+                                    self.dsp_kind = pending.dsp_kind;
                                     if let Some(engine) = &self.engine {
+                                        // SetDsp first so the rebuilt processor
+                                        // receives the new speed/pitch directly.
+                                        engine.send(Command::SetDsp(pending.dsp_kind));
                                         engine.send(Command::SetSpeed(pending.speed));
                                         engine.send(Command::SetPitch(
                                             pending.pitch_semitones,
@@ -188,6 +199,7 @@ impl App {
             speed: f32::from_bits(state.speed_bits.load(Ordering::Relaxed)),
             pitch_semitones: f32::from_bits(state.pitch_bits.load(Ordering::Relaxed)),
             last_position: state.position.load(Ordering::Relaxed),
+            dsp_kind: self.dsp_kind,
         };
 
         match session.save(&save_path) {
@@ -223,6 +235,7 @@ impl App {
             speed: session.speed,
             pitch_semitones: session.pitch_semitones,
             last_position: session.last_position,
+            dsp_kind: session.dsp_kind,
         });
         self.spawn_decode(session.track_path, ctx.clone());
     }
@@ -351,7 +364,13 @@ impl eframe::App for App {
                         }
 
                         ui.add_space(8.0);
-                        transport::show(ui, engine, track.sample_rate, track.frame_count());
+                        transport::show(
+                            ui,
+                            engine,
+                            &mut self.dsp_kind,
+                            track.sample_rate,
+                            track.frame_count(),
+                        );
                     } else {
                         ui.colored_label(
                             egui::Color32::LIGHT_RED,

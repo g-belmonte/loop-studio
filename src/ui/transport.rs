@@ -1,11 +1,22 @@
 use std::sync::atomic::Ordering;
 
+use crate::dsp::DspKind;
 use crate::engine::{Command, Engine};
 
 /// Render play/pause/stop + a seek slider. Returns true if the user is
 /// actively dragging the seek slider, so the caller can decide whether to
 /// keep repainting at high frequency.
-pub fn show(ui: &mut egui::Ui, engine: &Engine, sample_rate: u32, total_frames: u64) -> bool {
+///
+/// `dsp_kind` is the App's chosen stretch engine (UI source of truth, like
+/// the loop region). The selector edits it in place and sends `SetDsp` on
+/// change.
+pub fn show(
+    ui: &mut egui::Ui,
+    engine: &Engine,
+    dsp_kind: &mut DspKind,
+    sample_rate: u32,
+    total_frames: u64,
+) -> bool {
     let state = engine.state();
     let playing = state.playing.load(Ordering::Relaxed);
     let position = state.position.load(Ordering::Relaxed).min(total_frames);
@@ -75,6 +86,20 @@ pub fn show(ui: &mut egui::Ui, engine: &Engine, sample_rate: u32, total_frames: 
         }
         if ui.button("0 st").clicked() {
             engine.send(Command::SetPitch(0.0));
+        }
+    });
+
+    // Stretch-engine selector. Switching during playback rebuilds the DSP
+    // mid-stream — current speed/pitch carry across.
+    ui.horizontal(|ui| {
+        ui.label("Stretch engine:");
+        let prev = *dsp_kind;
+        ui.radio_value(dsp_kind, DspKind::Wsola, "WSOLA")
+            .on_hover_text("Cleaner transients (drums, plucks).");
+        ui.radio_value(dsp_kind, DspKind::PhaseVocoder, "Phase vocoder")
+            .on_hover_text("Cleaner sustained tones (vocals, strings).");
+        if *dsp_kind != prev {
+            engine.send(Command::SetDsp(*dsp_kind));
         }
     });
 

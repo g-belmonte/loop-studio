@@ -1908,6 +1908,7 @@ dependencies = [
  "egui",
  "env_logger",
  "log",
+ "realfft",
  "rfd",
  "ringbuf",
  "rubato",

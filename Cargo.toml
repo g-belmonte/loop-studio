@@ -17,6 +17,10 @@ symphonia = { version = "0.5", features = ["mp3", "flac", "vorbis", "wav", "aac"
 # DSP building blocks (resampling; time-stretch/pitch-shift impl TBD — see ARCHITECTURE.md)
 rubato = "0.16"
 
+# Real-input FFT for the phase-vocoder time-stretch (dsp/phase_vocoder.rs).
+# Built on rustfft; half the per-frame work of a complex FFT.
+realfft = "3"
+
 # Lock-free SPSC ring buffer between DSP and audio callback
 ringbuf = "0.4"
 

@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::dsp::DspKind;
 use crate::track::{LoopRegion, Track};
 
 #[derive(Debug, Clone)]
@@ -16,4 +17,9 @@ pub enum Command {
     SetLoop(Option<LoopRegion>),
     SetSpeed(f32),
     SetPitch(f32),
+    /// Switch DSP family. Tears down the current processor and rebuilds for
+    /// the loaded track's channel count, carrying current speed/pitch across.
+    /// No-op if no track is loaded yet — the kind is remembered and applied
+    /// on the next `LoadTrack`.
+    SetDsp(DspKind),
 }
