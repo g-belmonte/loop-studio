@@ -143,7 +143,7 @@ Independent time-stretch and pitch-shift is the hardest part of this project. We
 1. **Phase 1 — Passthrough** (`dsp/passthrough.rs`). ✅ Done. Wired the engine end-to-end with no DSP. Now serves as a fallback when DSP construction is degenerate (e.g. zero-channel track).
 2. **Phase 2 — Speed-coupled** (was `dsp/resample.rs`). ✅ Done in v0.1 step 5; **removed in step 6a** when `WsolaSpeed` replaced it. Used `rubato::SincFixedIn` with chunk = 1024 and `max_resample_ratio_relative = 4.0`. Speed slider worked but pitch was coupled to speed (turntable). Step 6b reintroduced a `rubato::SincFixedIn` *inside the WSOLA composite* (`WsolaPitchShift`) — same crate, no longer standalone.
 3. **Phase 3 — WSOLA + resample** (`dsp/wsola.rs`). Time-domain WSOLA for time-stretch — pure-Rust, low-latency. Cascade with `rubato` for pitch shift. This is the MVP target. **Subdivided into v0.1 steps 6a and 6b plus a v0.2 quality pass 6c — see plan below.** ✅ 6a done (`WsolaSpeed`); ✅ 6b done — `WsolaPitchShift` composite drives the engine, and the pitch slider is live in `ui::transport`; ✅ 6c done — AMDF + mono-mix similarity search, unity-gain OLA, and ramped stretch transitions.
-4. **Phase 4 — Phase vocoder** (`dsp/phase_vocoder.rs`). FFT-based time-stretch behind the same `TimePitchProcessor` trait, cascaded with `rubato` for pitch shift (mirrors `WsolaPitchShift`'s shape). Lives alongside WSOLA, not as a replacement: the user picks which engine drives a given track via a `DspKind` selector. **Subdivided into steps 8a (vanilla PV + selector — ✅ done) and 8b (refinements: Laroche–Dolson phase locking and transient-detect-and-passthrough — queued).**
+4. **Phase 4 — Phase vocoder** (`dsp/phase_vocoder.rs`). FFT-based time-stretch behind the same `TimePitchProcessor` trait, cascaded with `rubato` for pitch shift (mirrors `WsolaPitchShift`'s shape). Lives alongside WSOLA, not as a replacement: the user picks which engine drives a given track via a `DspKind` selector. **Subdivided into steps 8a (vanilla PV + selector — ✅ done) and 8b (refinements: Laroche–Dolson phase locking and transient-detect-and-passthrough — ✅ done).**
 5. **Phase 5 — FFI** (optional, license-permitting). Rubber Band or SoundTouch as opt-in features for top-tier quality.
 
 The `TimePitchProcessor` trait keeps the engine ignorant of which phase we're in. From step 8a onward, the engine *also* doesn't know which DSP family is active — that's chosen at construction time in `make_dsp` from a runtime `DspKind` enum.
@@ -221,17 +221,35 @@ State that survives across calls: `prev_phase[ch][k]`, `out_phase[ch][k]`, `synt
 - PV is more sensitive than WSOLA to FP noise in the phase accumulation when `H_a` ramps; if drift becomes audible during long ramps, periodically re-anchor `out_phase[k]` to the current frame's measured phase at synthesis-step boundaries.
 - A/B comparison ergonomics: switching kind mid-playback rebuilds the DSP and starts the new processor cold (`prev_phase_valid = false` etc.). The ring buffer keeps draining old samples, so the audible transition lasts ~85 ms. If it's intolerable in practice, add a brief cross-fade or stream restart on `SetDsp`. Defer until we hear how bad the unmitigated switch is.
 
-### Step 8b plan — PV refinements (queued, v0.2 follow-up)
+### Step 8b — PV refinements. ✅ Done.
 
-Two independent improvements; ship in either order based on which the audible testing of 8a shows is more painful:
+Two refinements layered on top of 8a, both confined to `dsp/phase_vocoder.rs`. The selector stays a binary `DspKind` — phase locking is the canonical PV behaviour after 8b, not a separate option.
 
-1. **Transient detection + passthrough.** Per analysis frame, compute a transient indicator (spectral flux — `Σ max(0, |X[k]| − |X_prev[k]|)` — or high-frequency energy spike, or both). When the indicator exceeds a threshold, *skip phase advancement for that frame*: copy the analysis phase straight to the synthesis phase. The result is a windowed copy of the original frame at its native phase, OLA'd into the output. Drum hits and pluck attacks recover their snap; sustained material is unaffected. Threshold and hysteresis are the only knobs; pick conservative defaults and expose nothing in the UI yet. Cheapest of the two refinements; biggest single audible win on percussive content.
+`PhaseVocoder::step` is now structured as four named passes so transient detection (which needs all channels' magnitudes) and phase locking (which runs after the trajectory pass overwrites `out_phase`) have well-defined inputs:
 
-2. **Laroche–Dolson phase locking.** After computing the synthesis phase per bin, identify spectral peaks (local magnitude maxima with a small neighbourhood). For each non-peak bin, replace its synthesis phase with the nearest peak's synthesis phase plus the analysis-time relative phase to that peak. This keeps the harmonics of a single source phase-coherent across frames, eliminating the residual "phasiness" / "warble" that vanilla PV leaves on sustained tones. Adds a peak-detect pass per frame and a phase-rewrite pass — still cheap, but more code than transient detection.
+1. **A — FFT pass.** Per channel: window the analysis frame, forward FFT, split the spectrum into `cur_mag[ch][k]` and `cur_phase[ch][k]`. Both arrays are read by the next two passes; splitting once avoids redundant `sqrt`/`atan2`.
+2. **B — Transient pass.** `detect_transient()` runs once per step on a sum-of-channels mono mix. Spectral flux `Σ_k max(0, mag_sum[k] − prev_mag_mono[k])` is compared against a slow EMA of recent flux. When `flux > flux_avg · TRANSIENT_THRESHOLD` (1.7) and the previous frame was *not* transient (one-frame hysteresis avoids double-firing on the attack tail), the frame is marked transient. The EMA uses `α = 0.05` (~14-frame half-life ≈ 0.3 s of audio at default settings). Detector lives on a mono mix so a transient on either channel triggers the same passthrough on both — keeps stereo image coherent. First-step (no prior) returns `false` and seeds the buffers.
+3. **C — Phase pass.** Per channel:
+   - If `frame_passthrough` (transient *or* first step): set `out_phase[ch][k] = cur_phase[ch][k]` for every bin. The synthesis spectrum becomes a phase-aligned copy of the analysis spectrum, so the IFFT produces a windowed copy of the input at its native phase. Drum hits / pluck attacks keep their snap. Phase locking is also skipped — there's no peak-driven trajectory to align non-peaks to.
+   - Otherwise: vanilla per-bin phase advance (`out_phase[k] += ω_true · H_s` with the same `Δφ` wrap and `ω_true = ω_k + Δφ/H_a` math as 8a), followed by `phase_lock(ch)`.
 
-Both changes are local to `phase_vocoder.rs` — neither touches the trait or the engine. The selector remains a binary `DspKind` (we're not exposing "vanilla PV" vs "phase-locked PV" as separate options; phase locking is the canonical PV behaviour after 8b).
+   `prev_phase[ch][k] = cur_phase[ch][k]` is saved at the end of every frame regardless of branch — `prev_phase` always tracks the actual analysis trajectory so next frame's `Δφ` is correct, even when the current frame's `out_phase` was anchored or locked.
+4. **D — Synthesis pass.** Per channel: build the synth spectrum `mag · exp(i · out_phase[k])`, force imag at DC and Nyquist to zero (realfft requires it), IFFT, normalise (× `1/N`), apply synthesis window, and OLA at `SYNTHESIS_HOP` into `synth_tail[ch]` / `out_queue[ch]` exactly as 8a.
 
-**Detour clause**: if 8a + 8b still don't satisfy on a particular kind of material, Phase 5 (FFI to Rubber Band or signalsmith-stretch) is the escape hatch. The trait shape doesn't need to change — we'd add another `DspKind` variant that wraps the FFI library.
+`phase_lock(ch)` per channel:
+- Compute the per-frame max magnitude; the relative peak floor `peak_floor = max_mag · PEAK_FLOOR_REL` (1e-4) filters out noise-floor "peaks" that would yank inaudible bins around.
+- 5-point local maximum: `mag[k]` is a peak iff `m[k] > m[k±1]` *and* `m[k] > m[k±2]` *and* `m[k] > peak_floor`. Skip the two end pairs — DC and Nyquist are forced real before IFFT, and edge bins contribute negligibly to perceived warble.
+- Walk all bins assigning each to the peak whose region of influence contains it. Region boundaries are at `(curr_peak + next_peak) / 2`; bins below the first peak's region and above the last peak's region are owned by the first/last peak respectively. Rewrite `out_phase[k] = out_phase[peak] + (cur_phase[k] − cur_phase[peak])` for every non-peak bin. The peak's own `out_phase` is left as the vanilla-advance trajectory.
+- No-op when the magnitude max is zero or no peaks survive the floor — non-peak bins keep their vanilla-advance phase.
+
+Knobs (constants at the top of `phase_vocoder.rs`, no UI):
+- `TRANSIENT_THRESHOLD = 1.7` — flux ratio to fire transient.
+- `FLUX_AVG_ALPHA = 0.05` — EMA smoothing factor.
+- `PEAK_FLOOR_REL = 1e-4` — peak floor as a fraction of per-frame max magnitude.
+
+Cost: one extra pass through `NUM_BINS` per channel for transient detection, two for phase locking (peak find + bin-to-peak walk). Negligible — the FFT/IFFT dominate.
+
+**Detour clause unchanged**: if 8a + 8b still don't satisfy on a particular kind of material, Phase 5 (FFI to Rubber Band or signalsmith-stretch) is the escape hatch. The trait shape doesn't need to change — we'd add another `DspKind` variant that wraps the FFI library.
 
 ## Why a custom mixer instead of `rodio`
 

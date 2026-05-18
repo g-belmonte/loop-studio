@@ -1,10 +1,10 @@
-// Phase 4 (v0.2 step 8a): FFT-based time-stretch via phase vocoder, cascaded
-// with a rubato resampler for pitch shift. Mirrors `wsola.rs`'s shape — same
-// trait adapters, same composite math, same stretch-ramp discipline — so the
-// engine is ignorant of which DSP family is active and the user can A/B them
-// per track via `DspKind`.
+// Phase 4 (v0.2 steps 8a + 8b): FFT-based time-stretch via phase vocoder,
+// cascaded with a rubato resampler for pitch shift. Mirrors `wsola.rs`'s
+// shape — same trait adapters, same composite math, same stretch-ramp
+// discipline — so the engine is ignorant of which DSP family is active and
+// the user can A/B them per track via `DspKind`.
 //
-// Algorithm (per synthesis step, per channel):
+// Step 8a — vanilla phase vocoder. Per synthesis step, per channel:
 //   1. Window the analysis frame, FFT it.
 //   2. For each bin k: extract magnitude and phase. Subtract the nominal
 //      phase advance ω_k · H_a, wrap to (-π, π], add back to ω_k to get the
@@ -14,11 +14,32 @@
 //   5. Window the output frame again (analysis × synthesis windowing) and
 //      OLA at hop H_s into the per-channel output queue.
 //
-// Step 8b will refine: transient-detect-and-passthrough (skip phase
-// advancement on percussive frames so drum hits keep their snap) and
-// Laroche–Dolson phase locking (lock non-peak bin phases to nearby spectral
-// peaks so harmonics stay coherent across frames). Both are local to this
-// file; neither touches the trait or the engine.
+// Step 8b — two refinements layered on top of 8a, both confined to `step()`:
+//
+//   • Transient-detect-and-passthrough. Spectral flux on a sum-of-channels
+//     mono mix (Σ_k max(0, |X_sum[k]| − |X_sum_prev[k]|)) is compared against
+//     a slow EMA of recent flux. When the ratio exceeds `TRANSIENT_THRESHOLD`
+//     (with one-frame hysteresis to avoid double-firing on the attack tail),
+//     we skip phase advancement *and* phase locking for that frame: every
+//     bin's synthesis phase is set to the analysis phase, so the IFFT
+//     produces a windowed copy of the input at its native phase. Drum hits /
+//     pluck attacks recover their snap; sustained material is unaffected.
+//     Detector lives on a mono mix so a transient on either channel triggers
+//     the same passthrough on both — keeps stereo image coherent.
+//
+//   • Laroche–Dolson phase locking. After computing the vanilla synthesis
+//     phase per bin: identify spectral peaks (5-point local magnitude
+//     maxima with a relative magnitude floor), then for each non-peak bin k
+//     replace `out_phase[k]` with `out_phase[peak_of_k] + (cur_phase[k] −
+//     cur_phase[peak_of_k])`. The peak's synthesis phase drives the
+//     trajectory; non-peak bins inherit the analysis-time relative phase.
+//     This keeps the harmonics of a single source phase-coherent across
+//     frames, eliminating the residual "phasiness" that vanilla PV leaves
+//     on sustained tones.
+//
+// Detour clause: if 8a + 8b still don't satisfy on a particular kind of
+// material, Phase 5 (FFI to Rubber Band or signalsmith-stretch) is the
+// escape hatch — the trait shape doesn't need to change.
 
 use std::sync::Arc;
 
@@ -68,6 +89,24 @@ const TRIM_KEEP_BEFORE: usize = FRAME_SIZE;
 const TWO_PI: f32 = std::f32::consts::TAU;
 const PI: f32 = std::f32::consts::PI;
 
+// ───────────────── Step 8b knobs ─────────────────────────────────────────────
+
+/// Mark a frame as transient when its spectral flux is at least this many
+/// times the running EMA of flux. 1.7 is conservative — high enough that
+/// only sharp attacks fire, low enough that genuine drum hits aren't missed.
+/// Tune from audible testing; nothing else in the algorithm should change
+/// across reasonable values in [1.4, 2.5].
+const TRANSIENT_THRESHOLD: f32 = 1.7;
+/// EMA smoothing factor for the flux running average: `avg ← (1−α)·avg + α·flux`.
+/// 0.05 → ~14-frame half-life, ~0.3 s of audio at default settings. Slow
+/// enough that the threshold tracks the song's overall texture, fast enough
+/// to adapt to a section change.
+const FLUX_AVG_ALPHA: f32 = 0.05;
+/// A bin must be at least this fraction of the per-frame max magnitude to
+/// count as a peak. Filters out noise-floor "peaks" that would yank phase
+/// around for inaudible bins. Empirical; nothing audible across [1e-5, 1e-3].
+const PEAK_FLOOR_REL: f32 = 1e-4;
+
 /// Streaming phase-vocoder time-stretch processor. Per-channel state
 /// (`prev_phase`, `out_phase`, OLA tail, queues) but shared timing
 /// (`analysis_pos`, `analysis_hop`, `stretch`) so all channels advance in
@@ -99,12 +138,36 @@ pub struct PhaseVocoder {
     /// Synthesis spectrum (built from magnitude + accumulated phase). Reused
     /// across channels — built fresh per channel before each IFFT.
     synth_spectrum: Vec<Complex<f32>>,
+    /// Per-channel current-frame analysis magnitude (split out of `spectrum`
+    /// so transient detection and phase locking can both read it without
+    /// re-running the sqrt). Step 8b.
+    cur_mag: Vec<Vec<f32>>,
+    /// Per-channel current-frame analysis phase. Step 8b — needed by phase
+    /// locking *after* the trajectory pass overwrites `out_phase`, so we
+    /// can't recover it from `prev_phase` (which gets overwritten last).
+    cur_phase: Vec<Vec<f32>>,
     /// Per-channel previous-frame analysis phase (for `Δφ` per bin).
     prev_phase: Vec<Vec<f32>>,
     /// Per-channel running synthesis phase, incremented by `ω_true · H_s`.
     out_phase: Vec<Vec<f32>>,
     /// Time-domain IFFT output. Reused across channels.
     ifft_out: Vec<f32>,
+
+    /// Mono-mixed (sum-of-channels) magnitude from the previous frame, used
+    /// as the reference for spectral-flux transient detection. Step 8b.
+    prev_mag_mono: Vec<f32>,
+    /// EMA of recent spectral flux. Compared against the current frame's
+    /// flux to decide transient. Step 8b.
+    flux_avg: f32,
+    /// True once the flux EMA has been seeded — first call returns
+    /// `transient = false` regardless of flux. Step 8b.
+    flux_avg_valid: bool,
+    /// Hysteresis: if the previous frame fired transient, this frame won't
+    /// (avoids double-firing on the attack tail). Step 8b.
+    prev_was_transient: bool,
+    /// Scratch for peak indices found in the current frame's magnitude
+    /// spectrum. Cleared and refilled per channel per step. Step 8b.
+    peaks_scratch: Vec<usize>,
 
     /// Real-input forward FFT plan (Send + Sync via realfft's bounds).
     fft: Arc<dyn RealToComplex<f32>>,
@@ -173,9 +236,16 @@ impl PhaseVocoder {
             extract: vec![vec![0.0; FRAME_SIZE]; channels],
             spectrum: vec![vec![Complex::new(0.0, 0.0); NUM_BINS]; channels],
             synth_spectrum: vec![Complex::new(0.0, 0.0); NUM_BINS],
+            cur_mag: vec![vec![0.0; NUM_BINS]; channels],
+            cur_phase: vec![vec![0.0; NUM_BINS]; channels],
             prev_phase: vec![vec![0.0; NUM_BINS]; channels],
             out_phase: vec![vec![0.0; NUM_BINS]; channels],
             ifft_out: vec![0.0; FRAME_SIZE],
+            prev_mag_mono: vec![0.0; NUM_BINS],
+            flux_avg: 0.0,
+            flux_avg_valid: false,
+            prev_was_transient: false,
+            peaks_scratch: Vec::with_capacity(NUM_BINS / 4),
             fft,
             ifft,
             fft_scratch,
@@ -268,10 +338,22 @@ impl PhaseVocoder {
         }
         self.analysis_pos = 0;
         self.prev_phase_valid = false;
+        self.flux_avg = 0.0;
+        self.flux_avg_valid = false;
+        self.prev_was_transient = false;
+        self.prev_mag_mono.iter_mut().for_each(|m| *m = 0.0);
     }
 
-    /// Run one PV analysis-synthesis step. Returns true on success, false if
-    /// not enough input is buffered yet.
+    /// Run one PV analysis-synthesis step. Structured as four passes so
+    /// transient detection (which needs all channels' magnitudes) and phase
+    /// locking (which runs after the trajectory pass overwrites `out_phase`)
+    /// have well-defined inputs:
+    ///   A. FFT pass:        per-channel window + FFT → `cur_mag`, `cur_phase`.
+    ///   B. Transient pass:  mono-mix flux → `frame_passthrough` flag.
+    ///   C. Phase pass:      either `out_phase = cur_phase` (passthrough) or
+    ///                       vanilla advance + Laroche–Dolson phase lock.
+    ///   D. Synthesis pass:  per-channel synth spectrum → IFFT → OLA.
+    /// Returns true on success, false if not enough input is buffered yet.
     fn step(&mut self) -> bool {
         self.advance_stretch_ramp();
 
@@ -284,8 +366,9 @@ impl PhaseVocoder {
         let h_s = SYNTHESIS_HOP as f32;
         let inv_n = 1.0 / FRAME_SIZE as f32;
 
+        // ───── A. FFT pass: per-channel window + FFT, split into mag/phase ──
         for ch in 0..self.channels {
-            // 1. Window the analysis frame into `extract[ch]`.
+            // Window the analysis frame into `extract[ch]`.
             {
                 let in_ch = &self.in_buf[ch];
                 let dst = &mut self.extract[ch];
@@ -294,8 +377,7 @@ impl PhaseVocoder {
                 }
             }
 
-            // 2. Forward FFT (realfft mutates `extract[ch]` in place — it's
-            //    overwritten next step, so that's fine).
+            // Forward FFT (realfft mutates `extract[ch]` in place).
             if let Err(e) = self.fft.process_with_scratch(
                 &mut self.extract[ch],
                 &mut self.spectrum[ch],
@@ -305,39 +387,66 @@ impl PhaseVocoder {
                 return false;
             }
 
-            // 3. Phase advance per bin.
+            // Split into magnitude + phase. Both are needed downstream
+            // (transient detection reads mag; phase locking reads both).
             for k in 0..NUM_BINS {
                 let bin = self.spectrum[ch][k];
-                let mag = (bin.re * bin.re + bin.im * bin.im).sqrt();
-                let phase = bin.im.atan2(bin.re);
+                self.cur_mag[ch][k] = (bin.re * bin.re + bin.im * bin.im).sqrt();
+                self.cur_phase[ch][k] = bin.im.atan2(bin.re);
+            }
+        }
 
-                if !self.prev_phase_valid {
-                    // First step: no prior phase to diff against. Anchor
-                    // out_phase to the analysis phase so the first IFFT
-                    // matches the input frame's actual phase relationships.
-                    self.out_phase[ch][k] = phase;
-                } else {
+        // ───── B. Transient pass: spectral flux on mono-mixed magnitudes ────
+        // First step has no prior frame to diff against; passthrough naturally
+        // (no transient flag, but the phase pass below treats first-step the
+        // same as transient — out_phase is anchored to analysis phase).
+        let frame_passthrough = !self.prev_phase_valid || self.detect_transient();
+
+        // ───── C. Phase pass: per-channel trajectory + optional locking ─────
+        for ch in 0..self.channels {
+            if frame_passthrough {
+                // Anchor synthesis phase to analysis phase. IFFT will produce
+                // a windowed copy of the input frame at its native phase —
+                // drum hit / pluck attack keeps its shape; on the first step
+                // it just bootstraps the trajectory.
+                for k in 0..NUM_BINS {
+                    self.out_phase[ch][k] = self.cur_phase[ch][k];
+                }
+            } else {
+                // Vanilla phase advance: out_phase[k] += ω_true · H_s.
+                for k in 0..NUM_BINS {
                     let omega_k = TWO_PI * k as f32 / FRAME_SIZE as f32;
                     let expected = omega_k * h_a;
-                    let mut dphase = phase - self.prev_phase[ch][k] - expected;
-                    // Wrap to (-π, π].
+                    let mut dphase = self.cur_phase[ch][k] - self.prev_phase[ch][k] - expected;
                     dphase = (dphase + PI).rem_euclid(TWO_PI) - PI;
                     let true_omega = omega_k + dphase / h_a;
                     self.out_phase[ch][k] += true_omega * h_s;
                 }
-                self.prev_phase[ch][k] = phase;
+                // Laroche–Dolson phase locking: snap non-peak bin phases to
+                // their nearest peak's synthesis phase (preserving the
+                // analysis-time relative phase).
+                self.phase_lock(ch);
+            }
 
-                // 4. Build synthesis spectrum.
+            // Save analysis phase for next frame's Δφ. (Phase locking only
+            // touches `out_phase`; `prev_phase` always tracks the actual
+            // analysis trajectory regardless of locking.)
+            for k in 0..NUM_BINS {
+                self.prev_phase[ch][k] = self.cur_phase[ch][k];
+            }
+        }
+
+        // ───── D. Synthesis pass: per-channel synth spectrum → IFFT → OLA ───
+        for ch in 0..self.channels {
+            for k in 0..NUM_BINS {
+                let mag = self.cur_mag[ch][k];
                 let p = self.out_phase[ch][k];
                 self.synth_spectrum[k] = Complex::new(mag * p.cos(), mag * p.sin());
             }
-
             // realfft requires imag(0) and imag(N/2) == 0 for a real result.
-            // Take the real part (drop any phase noise we accumulated there).
             self.synth_spectrum[0].im = 0.0;
             self.synth_spectrum[NUM_BINS - 1].im = 0.0;
 
-            // 5. Inverse FFT.
             if let Err(e) = self.ifft.process_with_scratch(
                 &mut self.synth_spectrum,
                 &mut self.ifft_out,
@@ -347,13 +456,13 @@ impl PhaseVocoder {
                 return false;
             }
 
-            // 6. Apply synthesis window and normalise (realfft is unnormalised:
-            //    forward × inverse round-trip scale = N).
+            // Apply synthesis window and normalise (realfft is unnormalised:
+            // forward × inverse round-trip scale = N).
             for i in 0..FRAME_SIZE {
                 self.ifft_out[i] = self.ifft_out[i] * inv_n * self.window[i];
             }
 
-            // 7. OLA into synth_tail; emit SYNTHESIS_HOP frames.
+            // OLA into synth_tail; emit SYNTHESIS_HOP frames.
             let tail = &mut self.synth_tail[ch];
             let queue = &mut self.out_queue[ch];
             queue.reserve(SYNTHESIS_HOP);
@@ -381,6 +490,118 @@ impl PhaseVocoder {
         }
 
         true
+    }
+
+    /// Spectral-flux transient detector. Builds a mono mix of the current
+    /// frame's per-bin magnitudes (sum across channels — a drum hit on
+    /// either channel should fire the same passthrough on both, so detection
+    /// runs on the sum), computes flux against `prev_mag_mono`, and compares
+    /// to a slow EMA. Returns true when this frame should passthrough.
+    ///
+    /// Side effects: updates `prev_mag_mono`, `flux_avg`, `flux_avg_valid`,
+    /// and `prev_was_transient`. Caller must guarantee `prev_phase_valid`
+    /// (a first-step "no prior" frame can't have flux — the caller short-
+    /// circuits that case).
+    fn detect_transient(&mut self) -> bool {
+        // Sum-of-channels mono magnitude + cumulative half-wave-rectified
+        // difference against last frame's mono magnitude. We update
+        // prev_mag_mono in the same pass to avoid a second loop.
+        let mut flux = 0.0_f32;
+        for k in 0..NUM_BINS {
+            let mut s = 0.0_f32;
+            for ch in 0..self.channels {
+                s += self.cur_mag[ch][k];
+            }
+            flux += (s - self.prev_mag_mono[k]).max(0.0);
+            self.prev_mag_mono[k] = s;
+        }
+
+        let transient = if self.flux_avg_valid {
+            flux > self.flux_avg * TRANSIENT_THRESHOLD && !self.prev_was_transient
+        } else {
+            false
+        };
+
+        if !self.flux_avg_valid {
+            self.flux_avg = flux;
+            self.flux_avg_valid = true;
+        } else {
+            self.flux_avg = (1.0 - FLUX_AVG_ALPHA) * self.flux_avg + FLUX_AVG_ALPHA * flux;
+        }
+        self.prev_was_transient = transient;
+
+        transient
+    }
+
+    /// Laroche–Dolson phase locking for one channel. Identifies spectral
+    /// peaks (5-point local magnitude maxima above a relative floor), assigns
+    /// each non-peak bin to the peak whose region of influence (defined by
+    /// midpoints between adjacent peaks) contains it, and rewrites the
+    /// non-peak's synthesis phase as `out_phase[peak] + (cur_phase[k] −
+    /// cur_phase[peak])`. The peak's own `out_phase` is left as the
+    /// vanilla-advance trajectory; non-peak bins inherit the analysis-time
+    /// relative phase to that peak.
+    ///
+    /// No-op when no peaks are found above the floor (e.g. noise-only or
+    /// silent frames) — non-peak bins keep their vanilla-advance phase.
+    fn phase_lock(&mut self, ch: usize) {
+        self.peaks_scratch.clear();
+
+        // Per-frame relative magnitude floor (filters out noise-floor
+        // "peaks" that would drag inaudible bins around).
+        let mut max_mag = 0.0_f32;
+        for &m in self.cur_mag[ch].iter() {
+            if m > max_mag {
+                max_mag = m;
+            }
+        }
+        if max_mag <= 0.0 {
+            return;
+        }
+        let peak_floor = max_mag * PEAK_FLOOR_REL;
+
+        // 5-point peak detection. Skipping the two end pairs at each side is
+        // fine — DC and Nyquist are handled separately (their imag is forced
+        // to zero before IFFT) and bins near the edges of the spectrum
+        // contribute negligibly to perceived warble.
+        for k in 2..(NUM_BINS - 2) {
+            let m = self.cur_mag[ch][k];
+            if m > peak_floor
+                && m > self.cur_mag[ch][k - 1]
+                && m > self.cur_mag[ch][k - 2]
+                && m > self.cur_mag[ch][k + 1]
+                && m > self.cur_mag[ch][k + 2]
+            {
+                self.peaks_scratch.push(k);
+            }
+        }
+
+        if self.peaks_scratch.is_empty() {
+            return;
+        }
+
+        // Walk all bins, mapping each to the peak whose region of influence
+        // contains it. Region boundaries are at midpoints between adjacent
+        // peaks; bins below the first peak's region and above the last
+        // peak's region are owned by the first/last peak respectively.
+        let mut peak_idx: usize = 0;
+        for k in 0..NUM_BINS {
+            while peak_idx + 1 < self.peaks_scratch.len() {
+                let curr_p = self.peaks_scratch[peak_idx];
+                let next_p = self.peaks_scratch[peak_idx + 1];
+                let mid = (curr_p + next_p) / 2;
+                if k > mid {
+                    peak_idx += 1;
+                } else {
+                    break;
+                }
+            }
+            let p = self.peaks_scratch[peak_idx];
+            if p != k {
+                self.out_phase[ch][k] =
+                    self.out_phase[ch][p] + (self.cur_phase[ch][k] - self.cur_phase[ch][p]);
+            }
+        }
     }
 }
 
