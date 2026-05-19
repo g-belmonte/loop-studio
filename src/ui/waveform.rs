@@ -79,21 +79,21 @@ pub fn show(
     }
 
     // Committed loop region.
-    if let Some(r) = loop_region {
-        if total_frames > 0 {
-            let x0 = frame_to_x(r.start, rect, total_frames);
-            let x1 = frame_to_x(r.end, rect, total_frames);
-            let region_rect = Rect::from_x_y_ranges(x0..=x1, rect.y_range());
-            painter.rect_filled(region_rect, 0.0, loop_fill);
-            painter.line_segment(
-                [Pos2::new(x0, rect.top()), Pos2::new(x0, rect.bottom())],
-                loop_border,
-            );
-            painter.line_segment(
-                [Pos2::new(x1, rect.top()), Pos2::new(x1, rect.bottom())],
-                loop_border,
-            );
-        }
+    if let Some(r) = loop_region
+        && total_frames > 0
+    {
+        let x0 = frame_to_x(r.start, rect, total_frames);
+        let x1 = frame_to_x(r.end, rect, total_frames);
+        let region_rect = Rect::from_x_y_ranges(x0..=x1, rect.y_range());
+        painter.rect_filled(region_rect, 0.0, loop_fill);
+        painter.line_segment(
+            [Pos2::new(x0, rect.top()), Pos2::new(x0, rect.bottom())],
+            loop_border,
+        );
+        painter.line_segment(
+            [Pos2::new(x1, rect.top()), Pos2::new(x1, rect.bottom())],
+            loop_border,
+        );
     }
 
     // Drag-to-define-loop. The drag's start frame is stashed in egui memory so
@@ -101,27 +101,28 @@ pub fn show(
     let drag_id = ui.make_persistent_id("waveform_drag_start");
     let mut drag_start: Option<u64> = ui.data(|d| d.get_temp(drag_id));
 
-    if response.drag_started() {
-        if let Some(p) = response.interact_pointer_pos() {
-            let f = pixel_x_to_frame(p.x, rect, total_frames);
-            ui.data_mut(|d| d.insert_temp(drag_id, f));
-            drag_start = Some(f);
-        }
+    if response.drag_started()
+        && let Some(p) = response.interact_pointer_pos()
+    {
+        let f = pixel_x_to_frame(p.x, rect, total_frames);
+        ui.data_mut(|d| d.insert_temp(drag_id, f));
+        drag_start = Some(f);
     }
 
-    if response.dragged() && total_frames > 0 {
-        if let (Some(start), Some(p)) = (drag_start, response.interact_pointer_pos()) {
-            let cur = pixel_x_to_frame(p.x, rect, total_frames);
-            let (lo, hi) = if start <= cur { (start, cur) } else { (cur, start) };
-            if hi > lo {
-                let x0 = frame_to_x(lo, rect, total_frames);
-                let x1 = frame_to_x(hi, rect, total_frames);
-                painter.rect_filled(
-                    Rect::from_x_y_ranges(x0..=x1, rect.y_range()),
-                    0.0,
-                    loop_preview_fill,
-                );
-            }
+    if response.dragged()
+        && total_frames > 0
+        && let (Some(start), Some(p)) = (drag_start, response.interact_pointer_pos())
+    {
+        let cur = pixel_x_to_frame(p.x, rect, total_frames);
+        let (lo, hi) = if start <= cur { (start, cur) } else { (cur, start) };
+        if hi > lo {
+            let x0 = frame_to_x(lo, rect, total_frames);
+            let x1 = frame_to_x(hi, rect, total_frames);
+            painter.rect_filled(
+                Rect::from_x_y_ranges(x0..=x1, rect.y_range()),
+                0.0,
+                loop_preview_fill,
+            );
         }
     }
 
@@ -162,10 +163,11 @@ pub fn show(
         }
     }
 
-    if response.clicked() && total_frames > 0 {
-        if let Some(p) = response.interact_pointer_pos() {
-            return WaveformAction::Seek(pixel_x_to_frame(p.x, rect, total_frames));
-        }
+    if response.clicked()
+        && total_frames > 0
+        && let Some(p) = response.interact_pointer_pos()
+    {
+        return WaveformAction::Seek(pixel_x_to_frame(p.x, rect, total_frames));
     }
 
     WaveformAction::None

@@ -234,8 +234,8 @@ impl Wsola {
     /// without round-tripping through interleaved layout.
     pub fn drain_output_planar(&mut self, dst: &mut [Vec<f32>], max_out: usize) -> usize {
         let n = self.out_queue[0].len().min(max_out);
-        for ch in 0..self.channels {
-            dst[ch].extend_from_slice(&self.out_queue[ch][..n]);
+        for (ch, out) in dst.iter_mut().enumerate().take(self.channels) {
+            out.extend_from_slice(&self.out_queue[ch][..n]);
             self.out_queue[ch].drain(..n);
         }
         n
@@ -354,8 +354,8 @@ impl Wsola {
         // 4. Apply Hann window to the extracted frame in place.
         for ch in 0..self.channels {
             let frame = &mut self.extract[ch];
-            for i in 0..FRAME_SIZE {
-                frame[i] *= self.window[i];
+            for (i, s) in frame.iter_mut().enumerate().take(FRAME_SIZE) {
+                *s *= self.window[i];
             }
         }
 
@@ -381,10 +381,10 @@ impl Wsola {
             //   for i in [SYNTHESIS_HOP, FRAME_SIZE):
             //     accumulator[i] = (i < OVERLAP ? tail[i] : 0) + frame[i]
             let nt = &mut self.new_tail_scratch[ch];
-            for ip in 0..OVERLAP {
+            for (ip, slot) in nt.iter_mut().enumerate().take(OVERLAP) {
                 let i = ip + SYNTHESIS_HOP;
                 let from_tail = if i < OVERLAP { tail[i] } else { 0.0 };
-                nt[ip] = from_tail + frame[i];
+                *slot = from_tail + frame[i];
             }
             std::mem::swap(tail, nt);
         }

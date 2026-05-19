@@ -312,8 +312,8 @@ impl PhaseVocoder {
 
     pub fn drain_output_planar(&mut self, dst: &mut [Vec<f32>], max_out: usize) -> usize {
         let n = self.out_queue[0].len().min(max_out);
-        for ch in 0..self.channels {
-            dst[ch].extend_from_slice(&self.out_queue[ch][..n]);
+        for (ch, out) in dst.iter_mut().enumerate().take(self.channels) {
+            out.extend_from_slice(&self.out_queue[ch][..n]);
             self.out_queue[ch].drain(..n);
         }
         n
@@ -466,14 +466,14 @@ impl PhaseVocoder {
             let tail = &mut self.synth_tail[ch];
             let queue = &mut self.out_queue[ch];
             queue.reserve(SYNTHESIS_HOP);
-            for i in 0..SYNTHESIS_HOP {
-                queue.push(tail[i] + self.ifft_out[i]);
+            for (i, &t) in tail.iter().enumerate().take(SYNTHESIS_HOP) {
+                queue.push(t + self.ifft_out[i]);
             }
             let nt = &mut self.new_tail_scratch[ch];
-            for ip in 0..OVERLAP {
+            for (ip, slot) in nt.iter_mut().enumerate().take(OVERLAP) {
                 let i = ip + SYNTHESIS_HOP;
                 let from_tail = if i < OVERLAP { tail[i] } else { 0.0 };
-                nt[ip] = from_tail + self.ifft_out[i];
+                *slot = from_tail + self.ifft_out[i];
             }
             std::mem::swap(tail, nt);
         }

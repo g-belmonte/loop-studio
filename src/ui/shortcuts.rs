@@ -105,10 +105,10 @@ pub fn handle(
             Key::Num6, Key::Num7, Key::Num8, Key::Num9,
         ];
         for (idx, key) in NUMS.iter().enumerate() {
-            if i.consume_key(Modifiers::NONE, *key) {
-                if let Some(m) = markers.get(idx) {
-                    engine.send(Command::Seek(m.frame));
-                }
+            if i.consume_key(Modifiers::NONE, *key)
+                && let Some(m) = markers.get(idx)
+            {
+                engine.send(Command::Seek(m.frame));
             }
         }
     });

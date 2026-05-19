@@ -51,23 +51,23 @@ pub fn run(rx: Receiver<Command>, state: Arc<SharedState>) {
             break;
         }
 
-        if playing {
-            if let (Some(t), Some(out)) = (&track, &mut output) {
-                produce(
-                    t,
-                    &mut cursor,
-                    loop_region,
-                    out,
-                    &mut *dsp,
-                    &mut scratch,
-                    &mut stitch_buf,
-                    &state,
-                );
+        if playing
+            && let (Some(t), Some(out)) = (&track, &mut output)
+        {
+            produce(
+                t,
+                &mut cursor,
+                loop_region,
+                out,
+                &mut *dsp,
+                &mut scratch,
+                &mut stitch_buf,
+                &state,
+            );
 
-                if loop_region.is_none() && cursor >= t.frame_count() {
-                    playing = false;
-                    state.playing.store(false, Ordering::Relaxed);
-                }
+            if loop_region.is_none() && cursor >= t.frame_count() {
+                playing = false;
+                state.playing.store(false, Ordering::Relaxed);
             }
         }
 
@@ -261,10 +261,10 @@ fn produce(
     // command handlers above already snap on Seek/SetLoop, but this catches
     // anything that slips through (e.g. a future code path that mutates the
     // cursor without going through a Command).
-    if let Some(l) = loop_region {
-        if *cursor >= l.end || *cursor < l.start {
-            *cursor = l.start;
-        }
+    if let Some(l) = loop_region
+        && (*cursor >= l.end || *cursor < l.start)
+    {
+        *cursor = l.start;
     }
 
     if *cursor >= total_frames {

@@ -4,7 +4,7 @@ use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
 
-use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use eframe::CreationContext;
 
 use crate::audio::decoder;
@@ -124,76 +124,70 @@ impl App {
     }
 
     fn drain_decode_results(&mut self) {
-        loop {
-            match self.load_rx.try_recv() {
-                Ok(LoadResult { path, result }) => {
-                    // Any [/] press from a previous track has no meaning here.
-                    self.pending_loop = None;
-                    // Clear markers by default; the session-restore branch below
-                    // repopulates them if the matching pending restore lands.
-                    self.markers.clear();
-                    self.status = match result {
-                        Ok((track, peaks)) => {
-                            log::info!(
-                                "loaded {}: {} Hz, {} ch, {} frames, {} peak buckets",
-                                path.display(),
-                                track.sample_rate,
-                                track.channels,
-                                track.frame_count(),
-                                peaks.len(),
-                            );
+        while let Ok(LoadResult { path, result }) = self.load_rx.try_recv() {
+            // Any [/] press from a previous track has no meaning here.
+            self.pending_loop = None;
+            // Clear markers by default; the session-restore branch below
+            // repopulates them if the matching pending restore lands.
+            self.markers.clear();
+            self.status = match result {
+                Ok((track, peaks)) => {
+                    log::info!(
+                        "loaded {}: {} Hz, {} ch, {} frames, {} peak buckets",
+                        path.display(),
+                        track.sample_rate,
+                        track.channels,
+                        track.frame_count(),
+                        peaks.len(),
+                    );
 
-                            // Default: clear the loop region. Overridden below
-                            // if a pending session restore matches this path.
-                            let mut new_loop = None;
+                    // Default: clear the loop region. Overridden below
+                    // if a pending session restore matches this path.
+                    let mut new_loop = None;
 
-                            if let Some(engine) = &self.engine {
-                                engine.send(Command::LoadTrack(track.clone()));
-                            }
+                    if let Some(engine) = &self.engine {
+                        engine.send(Command::LoadTrack(track.clone()));
+                    }
 
-                            if let Some(pending) = self.pending_restore.take() {
-                                if pending.path == path {
-                                    let total = track.frame_count();
-                                    new_loop = clamp_loop(pending.loop_region, total);
-                                    let last_pos = pending.last_position.min(total);
-                                    self.dsp_kind = pending.dsp_kind;
-                                    self.markers = clamp_markers(pending.markers, total);
-                                    (self.pitch_coarse, self.pitch_cents) =
-                                        split_pitch(pending.pitch_semitones);
-                                    if let Some(engine) = &self.engine {
-                                        // SetDsp first so the rebuilt processor
-                                        // receives the new speed/pitch directly.
-                                        engine.send(Command::SetDsp(pending.dsp_kind));
-                                        engine.send(Command::SetSpeed(pending.speed));
-                                        engine.send(Command::SetPitch(
-                                            pending.pitch_semitones,
-                                        ));
-                                        engine.send(Command::SetLoop(new_loop));
-                                        engine.send(Command::Seek(last_pos));
-                                    }
-                                }
-                                // else: a different file landed first — discard.
-                            }
-
-                            self.loop_region = new_loop;
-                            LoadStatus::Loaded { path, track, peaks }
+                    // If the pending restore is for a different path, take() still
+                    // consumes it — that's the discard.
+                    if let Some(pending) = self.pending_restore.take()
+                        && pending.path == path
+                    {
+                        let total = track.frame_count();
+                        new_loop = clamp_loop(pending.loop_region, total);
+                        let last_pos = pending.last_position.min(total);
+                        self.dsp_kind = pending.dsp_kind;
+                        self.markers = clamp_markers(pending.markers, total);
+                        (self.pitch_coarse, self.pitch_cents) =
+                            split_pitch(pending.pitch_semitones);
+                        if let Some(engine) = &self.engine {
+                            // SetDsp first so the rebuilt processor
+                            // receives the new speed/pitch directly.
+                            engine.send(Command::SetDsp(pending.dsp_kind));
+                            engine.send(Command::SetSpeed(pending.speed));
+                            engine.send(Command::SetPitch(pending.pitch_semitones));
+                            engine.send(Command::SetLoop(new_loop));
+                            engine.send(Command::Seek(last_pos));
                         }
-                        Err(e) => {
-                            log::warn!("failed to load {}: {e:#}", path.display());
-                            // A pending session restore for this path won't ever
-                            // resolve — drop it so a later open doesn't pick it up.
-                            if matches!(&self.pending_restore, Some(p) if p.path == path) {
-                                self.pending_restore = None;
-                            }
-                            LoadStatus::Failed {
-                                path,
-                                error: format!("{e:#}"),
-                            }
-                        }
-                    };
+                    }
+
+                    self.loop_region = new_loop;
+                    LoadStatus::Loaded { path, track, peaks }
                 }
-                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
-            }
+                Err(e) => {
+                    log::warn!("failed to load {}: {e:#}", path.display());
+                    // A pending session restore for this path won't ever
+                    // resolve — drop it so a later open doesn't pick it up.
+                    if matches!(&self.pending_restore, Some(p) if p.path == path) {
+                        self.pending_restore = None;
+                    }
+                    LoadStatus::Failed {
+                        path,
+                        error: format!("{e:#}"),
+                    }
+                }
+            };
         }
     }
 
