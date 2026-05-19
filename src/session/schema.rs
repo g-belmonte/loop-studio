@@ -15,14 +15,7 @@ pub struct Session {
     pub speed: f32,
     pub pitch_semitones: f32,
     pub last_position: u64,
-    /// Stretch-engine selection (added in schema v2). Absent in v1 sessions —
-    /// `#[serde(default)]` falls back to `DspKind::Wsola`, which matches v1's
-    /// only available behaviour.
-    #[serde(default)]
     pub dsp_kind: DspKind,
-    /// Navigation markers (added in schema v3). Absent in v1/v2 sessions —
-    /// `#[serde(default)]` falls back to an empty list.
-    #[serde(default)]
     pub markers: Vec<Marker>,
 }
 
@@ -41,12 +34,9 @@ impl Session {
             .with_context(|| format!("reading session from {}", path.display()))?;
         let session: Session =
             serde_json::from_slice(&bytes).context("parsing session JSON")?;
-        // Accept any version we know how to read — v1 (no dsp_kind / markers,
-        // both defaulted), v2 (no markers), or v3. Future versions error out so
-        // we don't silently misinterpret newer fields.
-        if session.version < 1 || session.version > Self::CURRENT_VERSION {
+        if session.version != Self::CURRENT_VERSION {
             bail!(
-                "unsupported session version {} (expected 1..={})",
+                "unsupported session version {} (expected {})",
                 session.version,
                 Self::CURRENT_VERSION
             );

@@ -49,17 +49,16 @@ pub trait TimePitchProcessor: Send {
 /// `make_dsp` time; switching kind at runtime tears down and rebuilds the
 /// processor (current speed/pitch are carried across).
 ///
-/// Serialised in sessions (schema v2) so a saved session restores with the
-/// engine the user had selected. v1 sessions deserialise with `Wsola` via
-/// `#[serde(default)]`.
+/// Serialised in sessions so a saved session restores with the engine the user
+/// had selected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum DspKind {
     /// WSOLA + rubato cascade (`wsola::WsolaPitchShift`). Cleaner transients.
-    #[default]
     #[serde(rename = "wsola")]
     Wsola,
     /// Phase vocoder + rubato cascade (`phase_vocoder::PhaseVocoderPitchShift`).
     /// Cleaner sustained tones; transients smear (mitigated in step 8b).
+    #[default]
     #[serde(rename = "phase_vocoder")]
     PhaseVocoder,
 }
