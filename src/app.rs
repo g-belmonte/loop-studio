@@ -9,13 +9,15 @@ use eframe::CreationContext;
 
 use crate::audio::decoder;
 use crate::dsp::DspKind;
+use crate::engine::metronome::MetronomeSettings;
 use crate::engine::{Command, Engine};
 use crate::session::{Session, auto as autosession};
 use crate::track::peaks::TrackPeaks;
 use crate::track::{LoopRegion, Marker, Track};
+use crate::ui::metronome::TapTempo;
 use crate::ui::shortcuts::LoopEndpoint;
 use crate::ui::waveform::{WaveformAction, WaveformView};
-use crate::ui::{markers as marker_list, menu, shortcuts, transport, waveform};
+use crate::ui::{markers as marker_list, menu, metronome as metronome_ui, shortcuts, transport, waveform};
 
 /// Debounce interval for per-track auto-save. A loaded track is checked once
 /// per interval; the file is rewritten only when the serialised state actually
@@ -53,6 +55,7 @@ struct PendingRestore {
     last_position: u64,
     dsp_kind: DspKind,
     markers: Vec<Marker>,
+    metronome: MetronomeSettings,
 }
 
 pub struct App {
@@ -81,6 +84,11 @@ pub struct App {
     /// across the "0 st" / "0 ct" reset buttons.
     pitch_coarse: i32,
     pitch_cents: i32,
+    /// Metronome settings (UI source of truth — engine sees a copy via
+    /// `Command::SetMetronome` on every change). Persisted in sessions.
+    metronome: MetronomeSettings,
+    /// Tap-tempo accumulator. Purely GUI; doesn't survive across runs.
+    tap_tempo: TapTempo,
     /// Visible window into the waveform. Reset to full-track on every load
     /// (not persisted in sessions — it's a viewport, not session state).
     view: WaveformView,
@@ -119,6 +127,8 @@ impl App {
             markers: Vec::new(),
             pitch_coarse: 0,
             pitch_cents: 0,
+            metronome: MetronomeSettings::default(),
+            tap_tempo: TapTempo::new(),
             view: WaveformView::full(0),
             follow_playhead: true,
             last_autosave_at: None,
@@ -145,6 +155,7 @@ impl App {
                 last_position: session.last_position,
                 dsp_kind: session.dsp_kind,
                 markers: session.markers,
+                metronome: session.metronome,
             });
         }
         self.spawn_decode(path, ctx.clone());
@@ -212,14 +223,20 @@ impl App {
                         let last_pos = pending.last_position.min(total);
                         self.dsp_kind = pending.dsp_kind;
                         self.markers = clamp_markers(pending.markers, total);
+                        self.metronome = pending.metronome;
                         (self.pitch_coarse, self.pitch_cents) =
                             split_pitch(pending.pitch_semitones);
                         if let Some(engine) = &self.engine {
                             // SetDsp first so the rebuilt processor
                             // receives the new speed/pitch directly.
+                            // SetMetronome before SetLoop so the engine's
+                            // metronome settings are in place when SetLoop
+                            // updates the anchor (and not before LoadTrack,
+                            // which resets the anchor on its own).
                             engine.send(Command::SetDsp(pending.dsp_kind));
                             engine.send(Command::SetSpeed(pending.speed));
                             engine.send(Command::SetPitch(pending.pitch_semitones));
+                            engine.send(Command::SetMetronome(pending.metronome));
                             engine.send(Command::SetLoop(new_loop));
                             engine.send(Command::Seek(last_pos));
                         }
@@ -268,6 +285,7 @@ impl App {
             last_position: state.position.load(Ordering::Relaxed),
             dsp_kind: self.dsp_kind,
             markers: self.markers.clone(),
+            metronome: self.metronome,
         };
         Some((track_path.clone(), session))
     }
@@ -362,6 +380,7 @@ impl App {
             last_position: session.last_position,
             dsp_kind: session.dsp_kind,
             markers: session.markers,
+            metronome: session.metronome,
         });
         self.spawn_decode(session.track_path, ctx.clone());
     }
@@ -437,6 +456,8 @@ impl eframe::App for App {
                 &mut self.pending_loop,
                 &mut self.markers,
                 &mut self.view,
+                &mut self.metronome,
+                &mut self.tap_tempo,
             );
         }
 
@@ -568,6 +589,10 @@ impl eframe::App for App {
                             track.sample_rate,
                             track.frame_count(),
                         );
+
+                        ui.add_space(8.0);
+                        ui.separator();
+                        metronome_ui::show(ui, &mut self.metronome, &mut self.tap_tempo, engine);
 
                         ui.add_space(8.0);
                         ui.separator();

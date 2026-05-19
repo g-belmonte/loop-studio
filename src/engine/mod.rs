@@ -1,4 +1,5 @@
 pub mod command;
+pub mod metronome;
 pub mod state;
 pub mod worker;
 

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::dsp::DspKind;
+use crate::engine::metronome::MetronomeSettings;
 use crate::track::{LoopRegion, Track};
 
 #[derive(Debug, Clone)]
@@ -22,4 +23,8 @@ pub enum Command {
     /// No-op if no track is loaded yet — the kind is remembered and applied
     /// on the next `LoadTrack`.
     SetDsp(DspKind),
+    /// Replace the metronome state in one shot. Cheap (Copy), so the UI
+    /// sends it on every relevant control change rather than splitting into
+    /// per-field commands.
+    SetMetronome(MetronomeSettings),
 }

@@ -2,8 +2,10 @@ use std::sync::atomic::Ordering;
 
 use egui::{Key, Modifiers};
 
+use crate::engine::metronome::MetronomeSettings;
 use crate::engine::{Command, Engine};
 use crate::track::{LoopRegion, Marker};
+use crate::ui::metronome::TapTempo;
 use crate::ui::waveform::{self, WaveformView};
 
 /// Multiplicative zoom factor for a single `+` / `-` press.
@@ -35,6 +37,8 @@ pub fn handle(
     pending_loop: &mut Option<LoopEndpoint>,
     markers: &mut Vec<Marker>,
     view: &mut WaveformView,
+    metronome: &mut MetronomeSettings,
+    tap_tempo: &mut TapTempo,
 ) {
     if ctx.wants_keyboard_input() {
         return;
@@ -114,6 +118,16 @@ pub fn handle(
         }
         if i.consume_key(Modifiers::NONE, Key::Minus) {
             waveform::zoom_at_playhead(view, total_frames, 1.0 / KEY_ZOOM_FACTOR, position);
+        }
+
+        // T: tap tempo. Updates BPM in place when there's enough history,
+        // and re-pushes the metronome state to the engine. Works whether or
+        // not the metronome is currently enabled — tap to set, then enable.
+        if i.consume_key(Modifiers::NONE, Key::T)
+            && let Some(bpm) = tap_tempo.tap()
+        {
+            metronome.bpm = bpm;
+            engine.send(Command::SetMetronome(*metronome));
         }
 
         // 1..9: jump to the Nth marker (1-indexed). Beyond 9 markers the

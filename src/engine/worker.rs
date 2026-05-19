@@ -11,6 +11,7 @@ use crate::dsp::phase_vocoder::{PhaseVocoderPitchShift, PhaseVocoderSpeed};
 use crate::dsp::wsola::{WsolaPitchShift, WsolaSpeed};
 use crate::dsp::{DspKind, TimePitchProcessor};
 use crate::engine::Command;
+use crate::engine::metronome::Metronome;
 use crate::engine::state::SharedState;
 use crate::track::{LoopRegion, Track};
 
@@ -28,6 +29,7 @@ pub fn run(rx: Receiver<Command>, state: Arc<SharedState>) {
     let mut dsp: Box<dyn TimePitchProcessor> = Box::new(Passthrough::new());
     let mut current_channels: Option<u16> = None;
     let mut current_kind: DspKind = DspKind::default();
+    let mut metronome = Metronome::new();
     let mut scratch: Vec<f32> = Vec::new();
     // Stitching buffer for chunks that straddle a loop boundary. Lazily sized
     // on first wrap; cost is one allocation per playback session.
@@ -44,6 +46,7 @@ pub fn run(rx: Receiver<Command>, state: Arc<SharedState>) {
             &mut dsp,
             &mut current_channels,
             &mut current_kind,
+            &mut metronome,
             &mut scratch,
             &state,
         );
@@ -60,6 +63,7 @@ pub fn run(rx: Receiver<Command>, state: Arc<SharedState>) {
                 loop_region,
                 out,
                 &mut *dsp,
+                &mut metronome,
                 &mut scratch,
                 &mut stitch_buf,
                 &state,
@@ -86,6 +90,7 @@ fn drain_commands(
     dsp: &mut Box<dyn TimePitchProcessor>,
     current_channels: &mut Option<u16>,
     current_kind: &mut DspKind,
+    metronome: &mut Metronome,
     scratch: &mut Vec<f32>,
     state: &SharedState,
 ) -> bool {
@@ -101,6 +106,7 @@ fn drain_commands(
                 dsp,
                 current_channels,
                 current_kind,
+                metronome,
                 scratch,
                 state,
             ),
@@ -121,6 +127,7 @@ fn apply(
     dsp: &mut Box<dyn TimePitchProcessor>,
     current_channels: &mut Option<u16>,
     current_kind: &mut DspKind,
+    metronome: &mut Metronome,
     scratch: &mut Vec<f32>,
     state: &SharedState,
 ) {
@@ -161,6 +168,11 @@ fn apply(
                 }
             }
 
+            metronome.set_sample_rate(new_track.sample_rate);
+            // Loop is cleared on load — anchor reverts to track start.
+            metronome.set_anchor(0);
+            metronome.reset_voice();
+
             *cursor = 0;
             *playing = false;
             *loop_region = None;
@@ -179,11 +191,13 @@ fn apply(
         }
         Command::Pause => {
             *playing = false;
+            metronome.reset_voice();
             state.playing.store(false, Ordering::Relaxed);
         }
         Command::Stop => {
             *playing = false;
             *cursor = 0;
+            metronome.reset_voice();
             state.playing.store(false, Ordering::Relaxed);
             state.position.store(0, Ordering::Relaxed);
         }
@@ -191,11 +205,13 @@ fn apply(
             if let Some(t) = track.as_ref() {
                 let target = pos.min(t.frame_count());
                 *cursor = snap_into_loop(target, *loop_region);
+                metronome.reset_voice();
                 state.position.store(*cursor, Ordering::Relaxed);
             }
         }
         Command::SetLoop(region) => {
             *loop_region = region;
+            metronome.set_anchor(region.map(|r| r.start).unwrap_or(0));
             let snapped = snap_into_loop(*cursor, *loop_region);
             if snapped != *cursor {
                 *cursor = snapped;
@@ -235,6 +251,9 @@ fn apply(
                 }
             }
         }
+        Command::SetMetronome(settings) => {
+            metronome.set_settings(settings);
+        }
     }
 }
 
@@ -248,6 +267,7 @@ fn produce(
     loop_region: Option<LoopRegion>,
     output: &mut ActiveOutput,
     dsp: &mut dyn TimePitchProcessor,
+    metronome: &mut Metronome,
     scratch: &mut Vec<f32>,
     stitch_buf: &mut Vec<f32>,
     state: &SharedState,
@@ -284,6 +304,7 @@ fn produce(
     }
 
     let in_samples = in_chunk * channels;
+    let cursor_before = *cursor;
 
     // Decide where the chunk's input comes from. Three cases:
     //   1) Plain slice: enough source before the loop end (or end of track).
@@ -297,44 +318,84 @@ fn produce(
     };
     let frames_avail = (boundary - *cursor) as usize;
 
-    let (input_slice, new_cursor): (&[f32], u64) = if frames_avail >= in_chunk {
-        let start = (*cursor as usize) * channels;
-        (&track.samples[start..start + in_samples], *cursor + in_chunk as u64)
-    } else if let Some(l) = loop_region {
-        let loop_length = (l.end - l.start) as usize;
-        if loop_length < in_chunk {
-            // Loop region shorter than one DSP chunk (~23 ms at 44.1 kHz).
-            // Not supported in v0.1; produce silence and bail.
+    // `stitch_tail_frames` is `Some(n)` only when we built `input_slice` from
+    // two source ranges: `[cursor_before, cursor_before + n)` followed by
+    // `[loop.start, loop.start + (in_chunk - n))`. The metronome needs this
+    // to schedule beats correctly across the wrap.
+    let (input_slice, new_cursor, stitch_tail_frames): (&[f32], u64, Option<usize>) =
+        if frames_avail >= in_chunk {
+            let start = (*cursor as usize) * channels;
+            (
+                &track.samples[start..start + in_samples],
+                *cursor + in_chunk as u64,
+                None,
+            )
+        } else if let Some(l) = loop_region {
+            let loop_length = (l.end - l.start) as usize;
+            if loop_length < in_chunk {
+                // Loop region shorter than one DSP chunk (~23 ms at 44.1 kHz).
+                // Not supported in v0.1; produce silence and bail.
+                return;
+            }
+            if stitch_buf.len() < in_samples {
+                stitch_buf.resize(in_samples, 0.0);
+            }
+            let cur_samples = (*cursor as usize) * channels;
+            let loop_start_samples = (l.start as usize) * channels;
+            let tail_frames = frames_avail;
+            let head_frames = in_chunk - tail_frames;
+            let tail_samples = tail_frames * channels;
+            let head_samples = head_frames * channels;
+            stitch_buf[..tail_samples]
+                .copy_from_slice(&track.samples[cur_samples..cur_samples + tail_samples]);
+            stitch_buf[tail_samples..in_samples].copy_from_slice(
+                &track.samples[loop_start_samples..loop_start_samples + head_samples],
+            );
+            (
+                &stitch_buf[..in_samples],
+                l.start + head_frames as u64,
+                Some(tail_frames),
+            )
+        } else {
+            // End of track without a loop. Drop the <chunk-sized tail and snap
+            // the cursor so the run loop's EOF check fires.
+            *cursor = total_frames;
+            state.position.store(*cursor, Ordering::Relaxed);
             return;
-        }
-        if stitch_buf.len() < in_samples {
-            stitch_buf.resize(in_samples, 0.0);
-        }
-        let cur_samples = (*cursor as usize) * channels;
-        let loop_start_samples = (l.start as usize) * channels;
-        let tail_frames = frames_avail;
-        let head_frames = in_chunk - tail_frames;
-        let tail_samples = tail_frames * channels;
-        let head_samples = head_frames * channels;
-        stitch_buf[..tail_samples]
-            .copy_from_slice(&track.samples[cur_samples..cur_samples + tail_samples]);
-        stitch_buf[tail_samples..in_samples].copy_from_slice(
-            &track.samples[loop_start_samples..loop_start_samples + head_samples],
-        );
-        (&stitch_buf[..in_samples], l.start + head_frames as u64)
-    } else {
-        // End of track without a loop. Drop the <chunk-sized tail and snap
-        // the cursor so the run loop's EOF check fires.
-        *cursor = total_frames;
-        state.position.store(*cursor, Ordering::Relaxed);
-        return;
-    };
+        };
 
     let (_in_used, out_written) =
         dsp.process(input_slice, &mut scratch[..scratch_size], channels);
 
     let out_samples = out_written * channels;
-    output.producer.push_slice(&scratch[..out_samples]);
+    let out_slice = &mut scratch[..out_samples];
+
+    // Mix metronome into the just-produced output. For stitched chunks we
+    // split the output proportionally to the source-frame split so each beat
+    // is scheduled against the correct source range. The proportional split
+    // is approximate (the DSP doesn't expose per-sample source correspondence)
+    // but with chunks ~23 ms the worst-case timing slip is below human
+    // onset precision.
+    if let (Some(tail_frames), Some(l)) = (stitch_tail_frames, loop_region) {
+        let tail_out = ((tail_frames as f64 * out_written as f64) / in_chunk as f64) as usize;
+        let tail_out = tail_out.min(out_written);
+        let head_out = out_written - tail_out;
+        let split = tail_out * channels;
+        let (tail_slice, head_slice) = out_slice.split_at_mut(split);
+        metronome.mix_segment(tail_slice, channels, cursor_before, tail_frames as u64);
+        if head_out > 0 {
+            metronome.mix_segment(
+                head_slice,
+                channels,
+                l.start,
+                (in_chunk - tail_frames) as u64,
+            );
+        }
+    } else {
+        metronome.mix_segment(out_slice, channels, cursor_before, in_chunk as u64);
+    }
+
+    output.producer.push_slice(out_slice);
 
     *cursor = new_cursor;
     state.position.store(*cursor, Ordering::Relaxed);

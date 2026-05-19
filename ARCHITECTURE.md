@@ -66,6 +66,7 @@ src/
 ├── engine/
 │   ├── mod.rs           # public Engine handle: spawn(), commands, state snapshot
 │   ├── command.rs       # Command enum sent GUI -> engine
+│   ├── metronome.rs     # source-frame-anchored click scheduler + mixer
 │   ├── state.rs         # SharedState: atomics read by GUI
 │   └── worker.rs        # the engine thread loop
 │
@@ -93,8 +94,9 @@ src/
     ├── mod.rs
     ├── transport.rs     # play/pause/seek/speed/pitch widgets
     ├── waveform.rs      # custom egui widget: peaks + playhead + loop region + markers + view (zoom/scroll)
-    ├── shortcuts.rs     # global keyboard handler (space/arrows/[/]/Esc/Home/End/M/1-9/+/-)
+    ├── shortcuts.rs     # global keyboard handler (space/arrows/[/]/Esc/Home/End/M/T/1-9/+/-)
     ├── markers.rs       # marker side list (seek button + label edit + delete)
+    ├── metronome.rs     # metronome row (toggle/BPM/Tap/accent/beats/volume) + tap-tempo accumulator
     └── menu.rs          # file menu, open/save session
 ```
 
@@ -112,6 +114,7 @@ pub enum Command {
     SetSpeed(f32),             // 0.25..=2.0
     SetPitch(f32),             // semitones, -12.0..=12.0
     SetDsp(DspKind),           // switch stretch engine; rebuilds DSP
+    SetMetronome(MetronomeSettings), // enabled / BPM / accent / beats / volume
 }
 
 // track/mod.rs
@@ -260,11 +263,11 @@ Cost: one extra pass through `NUM_BINS` per channel for transient detection, two
 
 ## Session format
 
-Versioned from day one so we can migrate without breaking saved sessions. The original v1 shape carried only loop region + speed + pitch + last position; v2 added `dsp_kind` (see step 8a); v3 adds `markers`. While the project is in alpha (pre-v0.1 release), `Session::load` only accepts `version == CURRENT_VERSION` — older sessions are rejected outright rather than carrying forward `#[serde(default)]` shims. Backward-compat migrations land when we ship a release. The current schema:
+Versioned from day one so we can migrate without breaking saved sessions. The original v1 shape carried only loop region + speed + pitch + last position; v2 added `dsp_kind` (see step 8a); v3 added `markers`; v4 adds `metronome`. While the project is in alpha (pre-v0.1 release), `Session::load` only accepts `version == CURRENT_VERSION` — older sessions are rejected outright rather than carrying forward `#[serde(default)]` shims. Backward-compat migrations land when we ship a release. The current schema:
 
 ```json
 {
-  "version": 3,
+  "version": 4,
   "track_path": "/home/me/music/song.flac",
   "track_sample_rate": 44100,
   "loop_region": { "start": 1234567, "end": 2345678 },
@@ -275,7 +278,14 @@ Versioned from day one so we can migrate without breaking saved sessions. The or
   "markers": [
     { "frame": 220500, "label": "verse 1" },
     { "frame": 661500, "label": "" }
-  ]
+  ],
+  "metronome": {
+    "enabled": false,
+    "bpm": 120.0,
+    "accent": true,
+    "beats_per_measure": 4,
+    "volume_db": -6.0
+  }
 }
 ```
 
@@ -324,6 +334,19 @@ Versioned from day one so we can migrate without breaking saved sessions. The or
   Considered and rejected: a bottom scrollbar widget (added visual weight for marginal discoverability gain since right-drag and shift+wheel already cover panning); storing the view in `egui::Memory` temp data (would lose it on widget IDs changing across track loads, and we want explicit reset semantics); recomputing peaks at higher resolution on zoom-in (RAM + complexity for a corner case — the practice-tool target is loops, not sample-level editing).
 - **Cents-level pitch nudge as a UI split, not a DSP or state change** (decided v0.2). Pitch is exposed as two sliders in `ui::transport`: a coarse `i32` semitone slider snapped to `[-12, 12]` and a fine `i32` cents slider snapped to `[-50, 50]`. The shared-state representation (`SharedState::pitch_bits` as f32 semitones), the `Command::SetPitch(f32)` wire, the `TimePitchProcessor::set_pitch_semitones` contract, and `Session::pitch_semitones` are all unchanged — the DSP already accepts continuous semitones via `2^(p/12)`, so "cents" is just sub-integer resolution that didn't have a UI affordance before. The two halves live in `App::pitch_coarse` / `App::pitch_cents` (UI source of truth, same pattern as `loop_region` and `dsp_kind`); on any slider change the UI sends `Command::SetPitch(coarse as f32 + cents as f32 / 100.0)`. Holding the split in App is what keeps the sliders independent: re-deriving them from the f32 total each frame couples them (dragging cents to ±50 rounds into the next semitone and snaps the coarse slider; "0 st" via `SetPitch(0.0)` zeros both halves). `App::split_pitch` does a one-shot round-to-nearest decomposition on session restore from `Session::pitch_semitones`; after that the App-held pair is sticky and never re-derived. The cents range is deliberately half a semitone, not a full one, so the two controls partition the space without overlap. Considered and rejected: narrowing the existing single slider's step to 0.01 (one cent per pixel is unusable on a 24-st range); splitting into two atomics / bumping the session schema (no behaviour gained — the round-trip of `1.13` is bit-exact through f32, and the coarse/fine intent is preserved entirely by App owning the split).
 - **Per-track session auto-save** (decided v0.2). Every loaded track is silently persisted to `$XDG_DATA_HOME/loop-studio/autosessions/<hash>.json` (falling back to `~/.local/share/...` when `XDG_DATA_HOME` is unset), keyed by an FNV-1a hash of the canonical track path so filenames stay stable across Rust toolchain upgrades — `std::hash::DefaultHasher` was rejected for that reason. The on-disk format is the existing `Session` schema (no new version), reusing `Session::save`/`load` end-to-end. Writes are debounced in `App::autosave_tick`: a tick per frame, an actual write at most once per `AUTOSAVE_INTERVAL = 2 s`, and only when the just-serialised JSON differs from the last successful write (so a paused track or static settings stop generating disk I/O). The outgoing track is flushed at the top of `drain_decode_results` *before* `Command::LoadTrack` reaches the engine — at that moment the engine state still reflects the old track, so the snapshot is correct. After a load, `last_autosave_at` is reset to `Instant::now()` (not `None`) so the first write waits one full interval, giving the engine time to apply the queued `SetSpeed`/`SetPitch`/`SetLoop`/`Seek` from a restore before we sample its position. `App::on_exit` flushes a final time on clean shutdown. Restore happens transparently in `open_dialog`: if `pending_restore` is empty (so the user opened a bare audio file, not an explicit session) and `autosession::load_for(&path)` finds a file, it's converted to a `PendingRestore` and applied by the same code path that handles `Load Session...`. Considered and rejected: storing autosessions next to the audio file (clutters the user's library); adding a UI toggle to disable auto-save (no flow benefits from it being off — the manual `Save Session…` workflow is unaffected by autosession writes since it picks its own path).
+- **Click track / metronome** (decided v0.3). `engine::metronome::Metronome` owns the click state — two pre-rendered 40 ms exponential-decay sine bursts (1 kHz / 1.5 kHz accent), a single in-flight "voice" (sample index into the active buffer; new beats override an in-flight click rather than layering — at musical tempos beats are >>40 ms apart), an anchor source-frame, and a `MetronomeSettings` copy. The UI ships the full `MetronomeSettings` struct on every change via `Command::SetMetronome`; doing pre-change/post-change diffing in `ui::metronome::show` avoids one command per slider pixel without splitting the API.
+
+  **Timing is source-frame-anchored**: beats fire at `anchor + k * (sr * 60 / bpm)` source frames, where `anchor` is `loop.start` (when a loop is active) or `0` (otherwise) — set by the worker on `LoadTrack` and `SetLoop`. Pinning to source frames means the click slows down with the speed slider so it stays in step with the recording — the natural choice for a practice tool, where the alternative (constant wall-clock BPM) would drift against the music whenever the user changes speed. Pinning the downbeat to `loop.start` makes each loop pass restart on beat 1 with no extra UI: practice loops are usually one-or-two-bar phrases the user already aligned via `[` / `]`, and if `loop_length` isn't an integer beats the wrap simply truncates the tail beats — musically correct.
+
+  **Mixing happens post-DSP**, in the engine worker's `produce()`, into the same scratch buffer the DSP just wrote, before pushing to the ring. Pre-DSP would route the click through WSOLA/PV (smeared, pitched, weird); a separate cpal stream would add an output device and force its own clock-sync problem. Per chunk we map the source range `[cursor_before, cursor_before + in_chunk)` to the produced output range `[0, out_written)` linearly — the DSP doesn't expose per-sample source correspondence, but with chunks ~23 ms the worst-case timing slip is well below human onset precision. Stitched loop-wrap chunks (source range straddles `loop.end`/`loop.start`) split the output proportionally to the source-frame split and `mix_segment` is called twice, so the downbeat at `loop.start` lands at the right output sample on every wrap.
+
+  Voice is reset on `Seek` / `Stop` / `Pause` so a click decay doesn't bleed across a transition; click buffers are rebuilt only on `LoadTrack` when the sample rate changes.
+
+  Tap tempo (`ui::metronome::TapTempo`) keeps the last 4 taps within a 2 s rolling window and reports `60 / mean(intervals)`, clamped to `[20, 400]` BPM. Mean over the last few intervals (rather than a median, or just the most recent) smooths one shaky tap without lagging a genuine tempo change. The `T` key calls the same path as the Tap button; both are no-ops when fewer than two taps are available.
+
+  Persisted in session schema v4 (`metronome: MetronomeSettings`). On session restore the engine sees `SetMetronome` *after* `SetSpeed`/`SetPitch` and *before* `SetLoop` — that ordering matters because `SetLoop` is what updates the metronome's anchor, and `SetMetronome` is otherwise anchor-agnostic.
+
+  Considered and rejected: a separate cpal stream for the click (a second output device and a clock-sync problem); pre-DSP mixing (click gets time-stretched and pitch-shifted with the music); layering multiple in-flight click voices (at musical tempos beats are >>40 ms apart, so the click decay always finishes before the next trigger — layering would buy nothing); modal "Set downbeat at playhead" (`B`-key) UI (the loop-start anchor already covers the common case in one fewer key, and an explicit downbeat key can land if practice with off-bar loops becomes a real workflow).
 - **Lenient session loading at the boundary** (decided v0.1 step 7). Saved sessions are validated only where the data could actually be wrong: the loop region is clamped to `[0, track_frame_count)` and dropped if degenerate (`start ≥ end` after clamping); `last_position` is clamped to track length; speed and pitch are passed through to the engine, which clamps them itself. The `version` field is checked strictly — any value other than `Session::CURRENT_VERSION = 1` errors out. A missing track file surfaces through the existing decode-failure path (`LoadStatus::Failed`) and clears the pending restore. JSON parse errors and write failures bubble up to a `session_error` line in the UI.
 
 ## Open questions
