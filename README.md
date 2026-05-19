@@ -44,7 +44,7 @@ See [ARCHITECTURE.md](./ARCHITECTURE.md) for thread layout, data flow, and modul
 
 ### v0.2 — Quality of life
 
-- [ ] Keyboard shortcuts (space, arrows, `[`/`]` for loop points).
+- [x] Keyboard shortcuts (space, arrows, `[`/`]` for loop points, Esc, Home/End — see [ARCHITECTURE.md decision](./ARCHITECTURE.md#decisions)).
 - [ ] Markers / cue points within a track.
 - [ ] Per-track session auto-save.
 - [ ] Zoom + scroll on waveform.

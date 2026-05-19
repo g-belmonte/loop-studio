@@ -13,8 +13,9 @@ use crate::engine::{Command, Engine};
 use crate::session::Session;
 use crate::track::peaks::TrackPeaks;
 use crate::track::{LoopRegion, Track};
+use crate::ui::shortcuts::LoopEndpoint;
 use crate::ui::waveform::WaveformAction;
-use crate::ui::{menu, transport, waveform};
+use crate::ui::{menu, shortcuts, transport, waveform};
 
 enum LoadStatus {
     Idle,
@@ -59,6 +60,10 @@ pub struct App {
     dsp_kind: DspKind,
     pending_restore: Option<PendingRestore>,
     session_error: Option<String>,
+    /// Half-defined loop from a `[` or `]` press waiting for its partner.
+    /// Reset whenever a track loads, the loop is cleared via Esc, or the
+    /// loop is committed. See `ui::shortcuts`.
+    pending_loop: Option<LoopEndpoint>,
 }
 
 impl App {
@@ -80,6 +85,7 @@ impl App {
             dsp_kind: DspKind::default(),
             pending_restore: None,
             session_error: None,
+            pending_loop: None,
         }
     }
 
@@ -107,6 +113,8 @@ impl App {
         loop {
             match self.load_rx.try_recv() {
                 Ok(LoadResult { path, result }) => {
+                    // Any [/] press from a previous track has no meaning here.
+                    self.pending_loop = None;
                     self.status = match result {
                         Ok((track, peaks)) => {
                             log::info!(
@@ -271,6 +279,22 @@ impl eframe::App for App {
             _ => {}
         }
 
+        // Global keyboard shortcuts. Runs before widget drawing so
+        // `consume_key` keeps arrow keys away from the seek slider when both
+        // could react to the same press.
+        if let (Some(engine), LoadStatus::Loaded { track, .. }) = (&self.engine, &self.status) {
+            let sr = track.sample_rate;
+            let total = track.frame_count();
+            shortcuts::handle(
+                ctx,
+                engine,
+                sr,
+                total,
+                &mut self.loop_region,
+                &mut self.pending_loop,
+            );
+        }
+
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
@@ -358,6 +382,7 @@ impl eframe::App for App {
                                 ));
                                 if ui.button("Clear loop").clicked() {
                                     self.loop_region = None;
+                                    self.pending_loop = None;
                                     engine.send(Command::SetLoop(None));
                                 }
                             });
