@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::dsp::DspKind;
-use crate::track::LoopRegion;
+use crate::track::{LoopRegion, Marker};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -20,10 +20,14 @@ pub struct Session {
     /// only available behaviour.
     #[serde(default)]
     pub dsp_kind: DspKind,
+    /// Navigation markers (added in schema v3). Absent in v1/v2 sessions —
+    /// `#[serde(default)]` falls back to an empty list.
+    #[serde(default)]
+    pub markers: Vec<Marker>,
 }
 
 impl Session {
-    pub const CURRENT_VERSION: u32 = 2;
+    pub const CURRENT_VERSION: u32 = 3;
 
     pub fn save(&self, path: &Path) -> Result<()> {
         let json = serde_json::to_string_pretty(self).context("serialising session")?;
@@ -37,9 +41,9 @@ impl Session {
             .with_context(|| format!("reading session from {}", path.display()))?;
         let session: Session =
             serde_json::from_slice(&bytes).context("parsing session JSON")?;
-        // Accept any version we know how to read — v1 (no dsp_kind, defaulted)
-        // or v2. Future versions error out so we don't silently misinterpret
-        // newer fields.
+        // Accept any version we know how to read — v1 (no dsp_kind / markers,
+        // both defaulted), v2 (no markers), or v3. Future versions error out so
+        // we don't silently misinterpret newer fields.
         if session.version < 1 || session.version > Self::CURRENT_VERSION {
             bail!(
                 "unsupported session version {} (expected 1..={})",

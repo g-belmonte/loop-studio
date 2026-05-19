@@ -13,7 +13,6 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 v0.1 is closed and v0.2 is in flight. Done so far: step 6c (WSOLA quality pass — AMDF similarity search over a sum-of-channels mono mix, unity-gain OLA, ramped stretch transitions), step 8a (phase vocoder + `DspKind` selector — `dsp/phase_vocoder.rs` cascaded with rubato, same composite shape as `WsolaPitchShift`; selector lives in `ui::transport`; session schema bumped to v2), and step 8b (PV refinements — transient-detect-and-passthrough on a sum-of-channels mono mix and Laroche–Dolson phase locking, both confined to `phase_vocoder.rs`'s restructured `step()`). Audible verification is still owed across the board — for 6c, exercise pitch-up on solo voice or sustained tones and drag both sliders during playback to confirm clicks are gone; for 8a/8b, A/B WSOLA vs PV on percussive material (PV should now keep drum hits sharp via transient passthrough) and on harmonic material (PV should be cleaner on sustained tones via phase locking).
 
 What's queued for the rest of v0.2:
-- Markers / cue points.
 - Per-track session auto-save.
 - Waveform zoom + scroll.
 - Cents-level pitch nudge.

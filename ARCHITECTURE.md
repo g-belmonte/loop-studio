@@ -91,8 +91,9 @@ src/
 └── ui/
     ├── mod.rs
     ├── transport.rs     # play/pause/seek/speed/pitch widgets
-    ├── waveform.rs      # custom egui widget: peaks + playhead + loop region
-    ├── shortcuts.rs     # global keyboard handler (space/arrows/[/]/Esc/Home/End)
+    ├── waveform.rs      # custom egui widget: peaks + playhead + loop region + markers
+    ├── shortcuts.rs     # global keyboard handler (space/arrows/[/]/Esc/Home/End/M/1-9)
+    ├── markers.rs       # marker side list (seek button + label edit + delete)
     └── menu.rs          # file menu, open/save session
 ```
 
@@ -256,21 +257,26 @@ Cost: one extra pass through `NUM_BINS` per channel for transient detection, two
 
 `rodio` models audio as composable `Source`s; that's elegant for game SFX but awkward when you need to (a) change effective playback rate live, (b) loop with sample-accurate boundaries, (c) keep position in *source* samples (not output samples) so the GUI can show where you are in the *track*. Owning the callback lets us treat the source position as the cursor of truth and project everything else from it.
 
-## Session format (v1)
+## Session format
+
+Versioned from day one so we can migrate without breaking saved sessions. The original v1 shape carried only loop region + speed + pitch + last position; v2 added `dsp_kind` (see step 8a); v3 adds `markers`. Older versions deserialise unchanged because every new field is `#[serde(default)]`. The current schema:
 
 ```json
 {
-  "version": 1,
+  "version": 3,
   "track_path": "/home/me/music/song.flac",
   "track_sample_rate": 44100,
   "loop_region": { "start": 1234567, "end": 2345678 },
   "speed": 0.75,
   "pitch_semitones": -2.0,
-  "last_position": 1500000
+  "last_position": 1500000,
+  "dsp_kind": "wsola",
+  "markers": [
+    { "frame": 220500, "label": "verse 1" },
+    { "frame": 661500, "label": "" }
+  ]
 }
 ```
-
-Versioned from day one so we can migrate without breaking saved sessions.
 
 ## Decisions
 
@@ -296,6 +302,11 @@ Versioned from day one so we can migrate without breaking saved sessions.
 - **WSOLA → resampler cascade for independent pitch** (decided v0.1 step 6b). WSOLA does the time-stretch and rubato handles the duration-preserving pitch shift, with `stretch = 2^(p/12) / speed` and `resample_ratio = 2^(-p/12)`. Considered and rejected: a single integrated phase vocoder (Phase 4) — adds an FFT dependency and we want to validate WSOLA quality first; doing pitch shift inside WSOLA via interpolated frame extraction — couples the algorithms in a way that's harder to swap out for Phase 4 later. The cascade keeps each stage understandable and lets us replace either independently.
 - **DSP fallback chain** (decided v0.1 step 6b). `make_dsp` tries `WsolaPitchShift` (full speed + pitch) → `WsolaSpeed` (speed only, pitch slider no-ops) → `Passthrough` (degenerate channel count). Only the rubato construction can realistically fail; if it does, dropping to `WsolaSpeed` keeps the speed slider working — better than degrading all the way to passthrough. The user sees a log warning, not a silent feature loss.
 - **Session restore is deferred until decode lands** (decided v0.1 step 7). `App::load_session` parses the JSON, stores a `PendingRestore` (track path + loop / speed / pitch / last position), and triggers the existing async decode. `drain_decode_results` consumes the `PendingRestore` once the matching `LoadResult` arrives, sending `LoadTrack` followed by `SetSpeed`, `SetPitch`, `SetLoop`, and `Seek` (in that order so the engine's "cursor stays inside the loop" invariant resolves correctly). The pending state is keyed by the track path, so a different file landing first discards it; a decode failure also drops the pending state to avoid replaying it on a later open. Considered and rejected: blocking the GUI on decode (kills responsiveness) and pre-decoding into a hidden cache (extra complexity for no UX gain).
+- **Markers / cue points** (decided v0.2). `App::markers: Vec<Marker>` (UI source of truth, parallel to `loop_region` — the engine never reads them). Kept sorted by `frame` and deduped on insert via `binary_search_by_key`; cleared on track load and on session load before `clamp_markers` repopulates from the saved set (`clamp_markers` drops frames past end-of-track, then sorts and dedupes — same boundary discipline as `clamp_loop`). Persisted in session schema v3 with `#[serde(default)]` so v1/v2 sessions read back as no-markers.
+
+  Surface: `M` adds a marker at the current playhead (no-op if one already exists at the same frame); `1`..`9` jump to the Nth marker (1-indexed; extras beyond 9 have no shortcut and are reached via the side list or Ctrl+arrows); Ctrl+→ steps to the next marker (smallest frame `> position`). Ctrl+← is *asymmetric*: it picks an anchor of "the most recent marker within ½ s behind the playhead, or `position` itself if there isn't one", then walks to the largest frame `< anchor`. The asymmetry is there because playback drift is forward-only: a moment after jumping to a marker, the playhead sits a few hundred ms past it, and a naive strict-`<` walk would yank back to the same marker every press. Forward stepping never gets stuck for the same reason — the drift moves the playhead *away* from the marker, so strict `>` already finds the next one. `ui::markers::show` renders the side list below the transport: one row per marker with index, a timestamp button that seeks, an editable label (`TextEdit`), and an `✕` delete button. While a label field is focused, `ctx.wants_keyboard_input()` is true and `shortcuts::handle` bails — so typing letters into a label can't accidentally fire `M` / `[` / `]`.
+
+  Considered and rejected: a marker-to-loop integration (`Shift+N` loops between marker N−1 and N, or a "loop between bracketing markers" key) — `[`/`]` already cover that workflow in two keystrokes, and adding a third path inflates the surface; deleting markers with a bare left-click on the waveform — too easy to fire accidentally while seeking, and the side list already has an unambiguous `✕`. Marker navigation goes through `Command::Seek`, so when a loop is active the engine's `snap_into_loop` still applies — jumping to a marker outside the loop snaps back to `loop.start` (same behaviour as the Home/End shortcuts, and the same way out: clear the loop first).
 - **Keyboard shortcuts** (decided v0.2). Bindings: Space toggles play/pause; Left/Right seek ∓5 s and Shift+Left/Right seek ∓1 s; Home/End jump to track start / `total_frames`, or to `loop.start` / `loop.end - 1` when a loop is active; Esc clears the loop; `[` and `]` set the loop start and end at the current playhead. End-with-loop seeks to `loop.end - 1` rather than `loop.end` so the engine's `snap_into_loop` invariant doesn't immediately yank the cursor back to `loop.start` and defeat the shortcut.
 
   `[` / `]` state machine: while no loop is active, the first press stashes a pending endpoint in `App::pending_loop` and the complementary press materialises the loop (auto-ordered so `start < end`). Once a loop is active, each key updates the matching edge in place; if the new edge would cross the other (e.g. `[` past the current end), the pair is reordered. `pending_loop` is cleared on track load, on Esc, and on the "Clear loop" button so a stale half-definition never carries over to a fresh region.

@@ -1,9 +1,10 @@
 use egui::{Color32, Pos2, Rect, Sense, Stroke, Vec2};
 
-use crate::track::LoopRegion;
 use crate::track::peaks::TrackPeaks;
+use crate::track::{LoopRegion, Marker};
 
 const LOOP_BORDER_COLOR: Color32 = Color32::from_rgb(255, 165, 0);
+const MARKER_COLOR: Color32 = Color32::from_rgb(120, 220, 130);
 
 /// Action returned by the waveform widget for the caller (App) to dispatch.
 #[derive(Debug, Clone, Copy)]
@@ -24,6 +25,7 @@ pub fn show(
     position_frame: u64,
     total_frames: u64,
     loop_region: Option<LoopRegion>,
+    markers: &[Marker],
     height: f32,
 ) -> WaveformAction {
     let desired = Vec2::new(ui.available_width(), height);
@@ -120,6 +122,21 @@ pub fn show(
                     loop_preview_fill,
                 );
             }
+        }
+    }
+
+    // Markers — drawn before the playhead so it stays on top when they coincide.
+    if total_frames > 0 {
+        let stroke = Stroke::new(1.0, MARKER_COLOR);
+        for m in markers {
+            if m.frame >= total_frames {
+                continue;
+            }
+            let x = frame_to_x(m.frame, rect, total_frames);
+            painter.line_segment(
+                [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+                stroke,
+            );
         }
     }
 

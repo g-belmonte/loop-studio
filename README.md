@@ -45,7 +45,7 @@ See [ARCHITECTURE.md](./ARCHITECTURE.md) for thread layout, data flow, and modul
 ### v0.2 — Quality of life
 
 - [x] Keyboard shortcuts (space, arrows, `[`/`]` for loop points, Esc, Home/End — see [ARCHITECTURE.md decision](./ARCHITECTURE.md#decisions)).
-- [ ] Markers / cue points within a track.
+- [x] Markers / cue points within a track (M to add at playhead, `1`–`9` / Ctrl+←/→ to navigate, editable labels in the side list — see [ARCHITECTURE.md decision](./ARCHITECTURE.md#decisions)).
 - [ ] Per-track session auto-save.
 - [ ] Zoom + scroll on waveform.
 - [ ] Cents-level pitch nudge.

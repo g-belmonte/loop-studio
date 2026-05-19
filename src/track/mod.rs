@@ -8,6 +8,15 @@ pub struct LoopRegion {
     pub end: u64,
 }
 
+/// A navigation point inside a track. Stored sorted by `frame` in `App`.
+/// `label` may be empty; the side list renders it as an editable text field.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Marker {
+    pub frame: u64,
+    #[serde(default)]
+    pub label: String,
+}
+
 pub struct Track {
     pub samples: Vec<f32>,   // interleaved
     pub sample_rate: u32,

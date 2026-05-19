@@ -12,10 +12,10 @@ use crate::dsp::DspKind;
 use crate::engine::{Command, Engine};
 use crate::session::Session;
 use crate::track::peaks::TrackPeaks;
-use crate::track::{LoopRegion, Track};
+use crate::track::{LoopRegion, Marker, Track};
 use crate::ui::shortcuts::LoopEndpoint;
 use crate::ui::waveform::WaveformAction;
-use crate::ui::{menu, shortcuts, transport, waveform};
+use crate::ui::{markers as marker_list, menu, shortcuts, transport, waveform};
 
 enum LoadStatus {
     Idle,
@@ -46,6 +46,7 @@ struct PendingRestore {
     pitch_semitones: f32,
     last_position: u64,
     dsp_kind: DspKind,
+    markers: Vec<Marker>,
 }
 
 pub struct App {
@@ -64,6 +65,10 @@ pub struct App {
     /// Reset whenever a track loads, the loop is cleared via Esc, or the
     /// loop is committed. See `ui::shortcuts`.
     pending_loop: Option<LoopEndpoint>,
+    /// Navigation markers for the loaded track, kept sorted by `frame`.
+    /// UI source of truth — the engine never reads markers. Reset on track
+    /// load; restored from `PendingRestore` on session load.
+    markers: Vec<Marker>,
 }
 
 impl App {
@@ -86,6 +91,7 @@ impl App {
             pending_restore: None,
             session_error: None,
             pending_loop: None,
+            markers: Vec::new(),
         }
     }
 
@@ -115,6 +121,9 @@ impl App {
                 Ok(LoadResult { path, result }) => {
                     // Any [/] press from a previous track has no meaning here.
                     self.pending_loop = None;
+                    // Clear markers by default; the session-restore branch below
+                    // repopulates them if the matching pending restore lands.
+                    self.markers.clear();
                     self.status = match result {
                         Ok((track, peaks)) => {
                             log::info!(
@@ -140,6 +149,7 @@ impl App {
                                     new_loop = clamp_loop(pending.loop_region, total);
                                     let last_pos = pending.last_position.min(total);
                                     self.dsp_kind = pending.dsp_kind;
+                                    self.markers = clamp_markers(pending.markers, total);
                                     if let Some(engine) = &self.engine {
                                         // SetDsp first so the rebuilt processor
                                         // receives the new speed/pitch directly.
@@ -208,6 +218,7 @@ impl App {
             pitch_semitones: f32::from_bits(state.pitch_bits.load(Ordering::Relaxed)),
             last_position: state.position.load(Ordering::Relaxed),
             dsp_kind: self.dsp_kind,
+            markers: self.markers.clone(),
         };
 
         match session.save(&save_path) {
@@ -244,9 +255,20 @@ impl App {
             pitch_semitones: session.pitch_semitones,
             last_position: session.last_position,
             dsp_kind: session.dsp_kind,
+            markers: session.markers,
         });
         self.spawn_decode(session.track_path, ctx.clone());
     }
+}
+
+/// Clamp markers from a session to the loaded track. Drops any whose frame
+/// is past end-of-track, sorts by frame, and dedupes exact-frame collisions
+/// (keeping the first label).
+fn clamp_markers(mut markers: Vec<Marker>, total_frames: u64) -> Vec<Marker> {
+    markers.retain(|m| m.frame < total_frames);
+    markers.sort_by_key(|m| m.frame);
+    markers.dedup_by_key(|m| m.frame);
+    markers
 }
 
 /// Clamp a saved loop region to the loaded track. Drops the loop if the
@@ -292,6 +314,7 @@ impl eframe::App for App {
                 total,
                 &mut self.loop_region,
                 &mut self.pending_loop,
+                &mut self.markers,
             );
         }
 
@@ -356,6 +379,7 @@ impl eframe::App for App {
                             position,
                             track.frame_count(),
                             self.loop_region,
+                            &self.markers,
                             160.0,
                         );
                         match action {
@@ -396,6 +420,10 @@ impl eframe::App for App {
                             track.sample_rate,
                             track.frame_count(),
                         );
+
+                        ui.add_space(8.0);
+                        ui.separator();
+                        marker_list::show(ui, &mut self.markers, track.sample_rate, engine);
                     } else {
                         ui.colored_label(
                             egui::Color32::LIGHT_RED,
