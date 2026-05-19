@@ -14,7 +14,7 @@ use crate::session::Session;
 use crate::track::peaks::TrackPeaks;
 use crate::track::{LoopRegion, Marker, Track};
 use crate::ui::shortcuts::LoopEndpoint;
-use crate::ui::waveform::WaveformAction;
+use crate::ui::waveform::{WaveformAction, WaveformView};
 use crate::ui::{markers as marker_list, menu, shortcuts, transport, waveform};
 
 enum LoadStatus {
@@ -75,6 +75,12 @@ pub struct App {
     /// across the "0 st" / "0 ct" reset buttons.
     pitch_coarse: i32,
     pitch_cents: i32,
+    /// Visible window into the waveform. Reset to full-track on every load
+    /// (not persisted in sessions — it's a viewport, not session state).
+    view: WaveformView,
+    /// When true, the view pages forward to keep the playhead in frame during
+    /// playback. Toggled from the UI; persists across track loads.
+    follow_playhead: bool,
 }
 
 impl App {
@@ -100,6 +106,8 @@ impl App {
             markers: Vec::new(),
             pitch_coarse: 0,
             pitch_cents: 0,
+            view: WaveformView::full(0),
+            follow_playhead: true,
         }
     }
 
@@ -144,6 +152,7 @@ impl App {
                     // Default: clear the loop region. Overridden below
                     // if a pending session restore matches this path.
                     let mut new_loop = None;
+                    self.view = WaveformView::full(track.frame_count());
 
                     if let Some(engine) = &self.engine {
                         engine.send(Command::LoadTrack(track.clone()));
@@ -333,6 +342,7 @@ impl eframe::App for App {
                 &mut self.loop_region,
                 &mut self.pending_loop,
                 &mut self.markers,
+                &mut self.view,
             );
         }
 
@@ -391,13 +401,18 @@ impl eframe::App for App {
 
                     if let Some(engine) = &self.engine {
                         let position = engine.state().position.load(Ordering::Relaxed);
+                        let total = track.frame_count();
+                        if self.follow_playhead {
+                            waveform::follow_playhead(&mut self.view, total, position);
+                        }
                         let action = waveform::show(
                             ui,
                             peaks,
                             position,
-                            track.frame_count(),
+                            total,
                             self.loop_region,
                             &self.markers,
+                            &mut self.view,
                             160.0,
                         );
                         match action {
@@ -410,6 +425,25 @@ impl eframe::App for App {
                                 engine.send(Command::SetLoop(Some(region)));
                             }
                         }
+
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut self.follow_playhead, "Follow playhead");
+                            let zoomed = self.view.len < total;
+                            if ui
+                                .add_enabled(zoomed, egui::Button::new("Reset zoom"))
+                                .clicked()
+                            {
+                                self.view = WaveformView::full(total);
+                            }
+                            ui.label(format!(
+                                "View: {} → {}",
+                                transport::format_time(self.view.start, track.sample_rate),
+                                transport::format_time(
+                                    self.view.end().min(total),
+                                    track.sample_rate
+                                ),
+                            ));
+                        });
 
                         if let Some(r) = self.loop_region {
                             ui.horizontal(|ui| {

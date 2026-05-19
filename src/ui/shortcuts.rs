@@ -4,6 +4,10 @@ use egui::{Key, Modifiers};
 
 use crate::engine::{Command, Engine};
 use crate::track::{LoopRegion, Marker};
+use crate::ui::waveform::{self, WaveformView};
+
+/// Multiplicative zoom factor for a single `+` / `-` press.
+const KEY_ZOOM_FACTOR: f32 = 1.5;
 
 /// One half of an in-progress `[`/`]` loop definition. While
 /// `pending` holds a value, the user has pressed one endpoint key and
@@ -21,6 +25,7 @@ pub enum LoopEndpoint {
 /// when it happens to have focus. Bails out when egui reports a text input
 /// wants keyboard input (we have no text inputs today but this stays
 /// correct if one is added).
+#[allow(clippy::too_many_arguments)]
 pub fn handle(
     ctx: &egui::Context,
     engine: &Engine,
@@ -29,6 +34,7 @@ pub fn handle(
     loop_region: &mut Option<LoopRegion>,
     pending_loop: &mut Option<LoopEndpoint>,
     markers: &mut Vec<Marker>,
+    view: &mut WaveformView,
 ) {
     if ctx.wants_keyboard_input() {
         return;
@@ -96,6 +102,18 @@ pub fn handle(
         // a no-op so a held key doesn't pile up identical entries.
         if i.consume_key(Modifiers::NONE, Key::M) {
             add_marker(markers, position);
+        }
+
+        // Zoom: Plus / Equals zoom in, Minus zooms out. Anchored on the
+        // playhead so repeated presses converge on the spot the user cares
+        // about. No-op when modifiers are held so Ctrl+= etc. stay free.
+        if i.consume_key(Modifiers::NONE, Key::Plus)
+            || i.consume_key(Modifiers::NONE, Key::Equals)
+        {
+            waveform::zoom_at_playhead(view, total_frames, KEY_ZOOM_FACTOR, position);
+        }
+        if i.consume_key(Modifiers::NONE, Key::Minus) {
+            waveform::zoom_at_playhead(view, total_frames, 1.0 / KEY_ZOOM_FACTOR, position);
         }
 
         // 1..9: jump to the Nth marker (1-indexed). Beyond 9 markers the

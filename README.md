@@ -47,7 +47,7 @@ See [ARCHITECTURE.md](./ARCHITECTURE.md) for thread layout, data flow, and modul
 - [x] Keyboard shortcuts (space, arrows, `[`/`]` for loop points, Esc, Home/End — see [ARCHITECTURE.md decision](./ARCHITECTURE.md#decisions)).
 - [x] Markers / cue points within a track (M to add at playhead, `1`–`9` / Ctrl+←/→ to navigate, editable labels in the side list — see [ARCHITECTURE.md decision](./ARCHITECTURE.md#decisions)).
 - [ ] Per-track session auto-save.
-- [ ] Zoom + scroll on waveform.
+- [x] Zoom + scroll on waveform (Ctrl+wheel / pinch / `+`–`-` to zoom, Shift+wheel / right-drag to pan, follow-playhead toggle — see [ARCHITECTURE.md decision](./ARCHITECTURE.md#decisions)).
 - [x] Cents-level pitch nudge (separate ±50 ct fine slider alongside the integer-semitone coarse slider — see [ARCHITECTURE.md decision](./ARCHITECTURE.md#decisions)).
 - [x] WSOLA quality pass: AMDF similarity search, OLA gain compensation, stretch ramping (see [ARCHITECTURE.md step 6c](./ARCHITECTURE.md#step-6c--wsola-quality-pass--done)).
 - [x] **Phase vocoder time-stretch** with WSOLA / PV runtime selector (see [ARCHITECTURE.md step 8a](./ARCHITECTURE.md#step-8a--vanilla-phase-vocoder--dsp-selector--done)). Trade-off: PV is cleaner on sustained tones, WSOLA is cleaner on transients — pick per track.
