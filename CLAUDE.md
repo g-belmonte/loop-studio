@@ -15,7 +15,6 @@ v0.1 is closed and v0.2 is in flight. Done so far: step 6c (WSOLA quality pass �
 What's queued for the rest of v0.2:
 - Per-track session auto-save.
 - Waveform zoom + scroll.
-- Cents-level pitch nudge.
 
 Ask the user which thread they want before starting — the order isn't determined. Detour clause for 8a/8b: if neither closes the gap on a particular kind of material, Phase 5 (FFI to Rubber Band or signalsmith-stretch) is the escape hatch — the trait shape stays the same.
 

@@ -69,6 +69,12 @@ pub struct App {
     /// UI source of truth — the engine never reads markers. Reset on track
     /// load; restored from `PendingRestore` on session load.
     markers: Vec<Marker>,
+    /// Pitch split (UI source of truth). The engine sees only the combined
+    /// `coarse + cents / 100.0` semitones via `Command::SetPitch`; holding
+    /// the two halves here keeps the sliders independent across edits and
+    /// across the "0 st" / "0 ct" reset buttons.
+    pitch_coarse: i32,
+    pitch_cents: i32,
 }
 
 impl App {
@@ -92,6 +98,8 @@ impl App {
             session_error: None,
             pending_loop: None,
             markers: Vec::new(),
+            pitch_coarse: 0,
+            pitch_cents: 0,
         }
     }
 
@@ -150,6 +158,8 @@ impl App {
                                     let last_pos = pending.last_position.min(total);
                                     self.dsp_kind = pending.dsp_kind;
                                     self.markers = clamp_markers(pending.markers, total);
+                                    (self.pitch_coarse, self.pitch_cents) =
+                                        split_pitch(pending.pitch_semitones);
                                     if let Some(engine) = &self.engine {
                                         // SetDsp first so the rebuilt processor
                                         // receives the new speed/pitch directly.
@@ -264,6 +274,20 @@ impl App {
 /// Clamp markers from a session to the loaded track. Drops any whose frame
 /// is past end-of-track, sorts by frame, and dedupes exact-frame collisions
 /// (keeping the first label).
+/// Decompose total semitones into the (coarse st, cents) pair the UI shows.
+/// Round-to-nearest keeps cents in `[-50, 50]` for any total in `[-12, 12]`;
+/// used once at session load and never again (the UI state is sticky after).
+fn split_pitch(total_semitones: f32) -> (i32, i32) {
+    let total = if total_semitones.is_finite() {
+        total_semitones
+    } else {
+        0.0
+    };
+    let coarse = (total.round() as i32).clamp(-12, 12);
+    let cents = (((total - coarse as f32) * 100.0).round() as i32).clamp(-50, 50);
+    (coarse, cents)
+}
+
 fn clamp_markers(mut markers: Vec<Marker>, total_frames: u64) -> Vec<Marker> {
     markers.retain(|m| m.frame < total_frames);
     markers.sort_by_key(|m| m.frame);
@@ -417,6 +441,8 @@ impl eframe::App for App {
                             ui,
                             engine,
                             &mut self.dsp_kind,
+                            &mut self.pitch_coarse,
+                            &mut self.pitch_cents,
                             track.sample_rate,
                             track.frame_count(),
                         );

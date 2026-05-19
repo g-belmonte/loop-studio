@@ -8,7 +8,7 @@ A practice-focused music player for musicians who learn by ear. Open a track, ma
 - Display the waveform; click to seek.
 - Set A/B loop points by clicking the waveform; loop seamlessly.
 - Change playback **speed** independently of pitch (0.25× – 2.0×).
-- Change **pitch** independently of speed (±12 semitones, fine cents later).
+- Change **pitch** independently of speed (±12 semitones coarse, ±50 cents fine).
 - Save and reload practice sessions (file path + loop + speed + pitch) as JSON.
 
 ## Status
@@ -48,7 +48,7 @@ See [ARCHITECTURE.md](./ARCHITECTURE.md) for thread layout, data flow, and modul
 - [x] Markers / cue points within a track (M to add at playhead, `1`–`9` / Ctrl+←/→ to navigate, editable labels in the side list — see [ARCHITECTURE.md decision](./ARCHITECTURE.md#decisions)).
 - [ ] Per-track session auto-save.
 - [ ] Zoom + scroll on waveform.
-- [ ] Cents-level pitch nudge.
+- [x] Cents-level pitch nudge (separate ±50 ct fine slider alongside the integer-semitone coarse slider — see [ARCHITECTURE.md decision](./ARCHITECTURE.md#decisions)).
 - [x] WSOLA quality pass: AMDF similarity search, OLA gain compensation, stretch ramping (see [ARCHITECTURE.md step 6c](./ARCHITECTURE.md#step-6c--wsola-quality-pass--done)).
 - [x] **Phase vocoder time-stretch** with WSOLA / PV runtime selector (see [ARCHITECTURE.md step 8a](./ARCHITECTURE.md#step-8a--vanilla-phase-vocoder--dsp-selector--done)). Trade-off: PV is cleaner on sustained tones, WSOLA is cleaner on transients — pick per track.
 - [x] PV refinements: Laroche–Dolson phase locking and transient-detect-and-passthrough (see [ARCHITECTURE.md step 8b](./ARCHITECTURE.md#step-8b--pv-refinements--done)). Closes the transient-smear gap that vanilla PV leaves.

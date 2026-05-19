@@ -10,10 +10,18 @@ use crate::engine::{Command, Engine};
 /// `dsp_kind` is the App's chosen stretch engine (UI source of truth, like
 /// the loop region). The selector edits it in place and sends `SetDsp` on
 /// change.
+///
+/// `pitch_coarse` and `pitch_cents` are likewise UI-owned — the engine only
+/// ever sees the combined `coarse + cents / 100.0` total via
+/// `Command::SetPitch`. Keeping the split here means the two sliders are
+/// independent: dragging cents to ±50 won't bump the semitone, and the "0 st"
+/// reset doesn't wipe the user's cents offset (and vice versa).
 pub fn show(
     ui: &mut egui::Ui,
     engine: &Engine,
     dsp_kind: &mut DspKind,
+    pitch_coarse: &mut i32,
+    pitch_cents: &mut i32,
     sample_rate: u32,
     total_frames: u64,
 ) -> bool {
@@ -70,22 +78,39 @@ pub fn show(
         }
     });
 
-    // Pitch control. Linear in semitones — equal perceptual steps.
-    let mut pitch = f32::from_bits(state.pitch_bits.load(Ordering::Relaxed));
-    if !pitch.is_finite() {
-        pitch = 0.0;
-    }
+    // Pitch control split into coarse (integer semitones) and fine (cents).
+    // The two values live in App so the sliders don't bleed into each other
+    // through a round-trip via the shared-state total; on any change we send
+    // the combined value to the engine.
+    let send_combined = |coarse: i32, cents: i32| {
+        engine.send(Command::SetPitch(coarse as f32 + cents as f32 / 100.0));
+    };
     ui.horizontal(|ui| {
         let r = ui.add(
-            egui::Slider::new(&mut pitch, -12.0..=12.0)
+            egui::Slider::new(pitch_coarse, -12..=12)
                 .suffix(" st")
                 .text("pitch"),
         );
         if r.changed() {
-            engine.send(Command::SetPitch(pitch));
+            send_combined(*pitch_coarse, *pitch_cents);
         }
         if ui.button("0 st").clicked() {
-            engine.send(Command::SetPitch(0.0));
+            *pitch_coarse = 0;
+            send_combined(*pitch_coarse, *pitch_cents);
+        }
+    });
+    ui.horizontal(|ui| {
+        let r = ui.add(
+            egui::Slider::new(pitch_cents, -50..=50)
+                .suffix(" ct")
+                .text("fine"),
+        );
+        if r.changed() {
+            send_combined(*pitch_coarse, *pitch_cents);
+        }
+        if ui.button("0 ct").clicked() {
+            *pitch_cents = 0;
+            send_combined(*pitch_coarse, *pitch_cents);
         }
     });
 
