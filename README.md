@@ -13,7 +13,7 @@ A practice-focused music player for musicians who learn by ear. Open a track, ma
 
 ## Status
 
-v0.1 (MVP) shipped: every checkbox below in the v0.1 list is implemented. Active work is moving to v0.2 — first WSOLA quality pass (step 6c) is in (AMDF similarity search, unity-gain OLA, ramped stretch transitions).
+v0.1 (MVP) shipped, v0.2 closed: every checkbox in both lists is implemented. Next work moves to v0.3 (practice features).
 
 ## Tech stack
 
@@ -44,14 +44,16 @@ See [ARCHITECTURE.md](./ARCHITECTURE.md) for thread layout, data flow, and modul
 
 ### v0.2 — Quality of life
 
-- [x] Keyboard shortcuts (space, arrows, `[`/`]` for loop points, Esc, Home/End — see [ARCHITECTURE.md decision](./ARCHITECTURE.md#decisions)).
-- [x] Markers / cue points within a track (M to add at playhead, `1`–`9` / Ctrl+←/→ to navigate, editable labels in the side list — see [ARCHITECTURE.md decision](./ARCHITECTURE.md#decisions)).
-- [ ] Per-track session auto-save.
-- [x] Zoom + scroll on waveform (Ctrl+wheel / pinch / `+`–`-` to zoom, Shift+wheel / right-drag to pan, follow-playhead toggle — see [ARCHITECTURE.md decision](./ARCHITECTURE.md#decisions)).
-- [x] Cents-level pitch nudge (separate ±50 ct fine slider alongside the integer-semitone coarse slider — see [ARCHITECTURE.md decision](./ARCHITECTURE.md#decisions)).
-- [x] WSOLA quality pass: AMDF similarity search, OLA gain compensation, stretch ramping (see [ARCHITECTURE.md step 6c](./ARCHITECTURE.md#step-6c--wsola-quality-pass--done)).
-- [x] **Phase vocoder time-stretch** with WSOLA / PV runtime selector (see [ARCHITECTURE.md step 8a](./ARCHITECTURE.md#step-8a--vanilla-phase-vocoder--dsp-selector--done)). Trade-off: PV is cleaner on sustained tones, WSOLA is cleaner on transients — pick per track.
-- [x] PV refinements: Laroche–Dolson phase locking and transient-detect-and-passthrough (see [ARCHITECTURE.md step 8b](./ARCHITECTURE.md#step-8b--pv-refinements--done)). Closes the transient-smear gap that vanilla PV leaves.
+- [x] **Keyboard shortcuts** (space, arrows, `[`/`]`, Esc, Home/End).
+- [x] **Markers / cue points** (M to add, `1`–`9` / Ctrl+←/→ to navigate, editable labels).
+- [x] **Per-track session auto-save** (debounced writes under `$XDG_DATA_HOME/loop-studio/autosessions/`, restored on Open).
+- [x] **Waveform zoom + scroll** (Ctrl+wheel / pinch / `+`–`-` to zoom, Shift+wheel / right-drag to pan, follow-playhead toggle).
+- [x] **Cents-level pitch nudge** (±50 ct fine slider alongside the ±12 st coarse slider).
+- [x] **WSOLA quality pass**: AMDF similarity search, OLA gain compensation, stretch ramping.
+- [x] **Phase vocoder time-stretch** with WSOLA / PV runtime selector (PV cleaner on sustained tones, WSOLA cleaner on transients — pick per track).
+- [x] **PV refinements**: Laroche–Dolson phase locking and transient-detect-and-passthrough.
+
+See [ARCHITECTURE.md](./ARCHITECTURE.md#decisions) for the design notes behind each item.
 
 ### v0.3 — Practice features
 

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use eframe::CreationContext;
@@ -10,12 +10,18 @@ use eframe::CreationContext;
 use crate::audio::decoder;
 use crate::dsp::DspKind;
 use crate::engine::{Command, Engine};
-use crate::session::Session;
+use crate::session::{Session, auto as autosession};
 use crate::track::peaks::TrackPeaks;
 use crate::track::{LoopRegion, Marker, Track};
 use crate::ui::shortcuts::LoopEndpoint;
 use crate::ui::waveform::{WaveformAction, WaveformView};
 use crate::ui::{markers as marker_list, menu, shortcuts, transport, waveform};
+
+/// Debounce interval for per-track auto-save. A loaded track is checked once
+/// per interval; the file is rewritten only when the serialised state actually
+/// changed since the last write (so a paused track or static settings don't
+/// keep churning the disk).
+const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(2);
 
 enum LoadStatus {
     Idle,
@@ -81,6 +87,13 @@ pub struct App {
     /// When true, the view pages forward to keep the playhead in frame during
     /// playback. Toggled from the UI; persists across track loads.
     follow_playhead: bool,
+    /// Last time the auto-saver fired its periodic tick. Compared against
+    /// `AUTOSAVE_INTERVAL` to debounce writes during playback.
+    last_autosave_at: Option<Instant>,
+    /// Serialised JSON of the last successfully written autosession. Used as
+    /// a cheap dirty-check: if `build_session()` re-serialises to the same
+    /// bytes, the on-disk file is already up to date and we skip the write.
+    last_autosave_json: Option<String>,
 }
 
 impl App {
@@ -108,6 +121,8 @@ impl App {
             pitch_cents: 0,
             view: WaveformView::full(0),
             follow_playhead: true,
+            last_autosave_at: None,
+            last_autosave_json: None,
         }
     }
 
@@ -115,6 +130,23 @@ impl App {
         let Some(path) = menu::pick_audio_file() else {
             return;
         };
+        // Auto-restore: if we've seen this track before, queue its saved
+        // state so `drain_decode_results` applies it once decode lands.
+        // An explicit Load Session... already populates `pending_restore`,
+        // so we don't overwrite it here.
+        if self.pending_restore.is_none()
+            && let Some(session) = autosession::load_for(&path)
+        {
+            self.pending_restore = Some(PendingRestore {
+                path: path.clone(),
+                loop_region: session.loop_region,
+                speed: session.speed,
+                pitch_semitones: session.pitch_semitones,
+                last_position: session.last_position,
+                dsp_kind: session.dsp_kind,
+                markers: session.markers,
+            });
+        }
         self.spawn_decode(path, ctx.clone());
     }
 
@@ -133,6 +165,18 @@ impl App {
 
     fn drain_decode_results(&mut self) {
         while let Ok(LoadResult { path, result }) = self.load_rx.try_recv() {
+            // Flush the outgoing track's state before we hand the engine a
+            // new track and reset our UI fields. `autosave_flush` reads the
+            // engine state for whichever track is *currently* loaded — at
+            // this point that's still the old one.
+            self.autosave_flush();
+            // The new track starts fresh as far as the dirty-check goes.
+            // Setting `last_autosave_at` to now (rather than None) delays the
+            // first save by AUTOSAVE_INTERVAL so the engine has time to apply
+            // the queued LoadTrack / SetSpeed / SetPitch / Seek / SetLoop
+            // commands before we sample its state.
+            self.last_autosave_json = None;
+            self.last_autosave_at = Some(Instant::now());
             // Any [/] press from a previous track has no meaning here.
             self.pending_loop = None;
             // Clear markers by default; the session-restore branch below
@@ -200,27 +244,19 @@ impl App {
         }
     }
 
-    fn save_session(&mut self) {
+    /// Snapshot the current loaded track + engine state into a `Session`.
+    /// Returns `None` when there's nothing to save (no track loaded, or the
+    /// engine failed to start). Shared by manual save and auto-save.
+    fn build_session(&self) -> Option<(PathBuf, Session)> {
         let LoadStatus::Loaded {
             path: track_path,
             track,
             ..
         } = &self.status
         else {
-            return;
+            return None;
         };
-        let Some(engine) = &self.engine else { return };
-
-        let default_name = track_path
-            .file_stem()
-            .map(|s| format!("{}.session.json", s.to_string_lossy()))
-            .unwrap_or_else(|| "session.json".into());
-        let default_dir = track_path.parent();
-
-        let Some(save_path) = menu::pick_session_save(&default_name, default_dir) else {
-            return;
-        };
-
+        let engine = self.engine.as_ref()?;
         let state = engine.state();
         let session = Session {
             version: Session::CURRENT_VERSION,
@@ -233,6 +269,23 @@ impl App {
             dsp_kind: self.dsp_kind,
             markers: self.markers.clone(),
         };
+        Some((track_path.clone(), session))
+    }
+
+    fn save_session(&mut self) {
+        let Some((track_path, session)) = self.build_session() else {
+            return;
+        };
+
+        let default_name = track_path
+            .file_stem()
+            .map(|s| format!("{}.session.json", s.to_string_lossy()))
+            .unwrap_or_else(|| "session.json".into());
+        let default_dir = track_path.parent();
+
+        let Some(save_path) = menu::pick_session_save(&default_name, default_dir) else {
+            return;
+        };
 
         match session.save(&save_path) {
             Ok(()) => {
@@ -242,6 +295,46 @@ impl App {
             Err(e) => {
                 log::warn!("failed to save session: {e:#}");
                 self.session_error = Some(format!("Save failed: {e:#}"));
+            }
+        }
+    }
+
+    /// Periodic auto-save tick. Called every frame; bails out fast when
+    /// the debounce hasn't elapsed or nothing has changed.
+    fn autosave_tick(&mut self) {
+        let now = Instant::now();
+        if let Some(prev) = self.last_autosave_at
+            && now.duration_since(prev) < AUTOSAVE_INTERVAL
+        {
+            return;
+        }
+        self.last_autosave_at = Some(now);
+        self.autosave_flush();
+    }
+
+    /// Write the current state to the per-track autosession file if it
+    /// differs from the last write. Safe to call when no track is loaded
+    /// (it just no-ops).
+    fn autosave_flush(&mut self) {
+        let Some((track_path, session)) = self.build_session() else {
+            return;
+        };
+        let json = match serde_json::to_string_pretty(&session) {
+            Ok(j) => j,
+            Err(e) => {
+                log::warn!("autosession serialise failed: {e:#}");
+                return;
+            }
+        };
+        if self.last_autosave_json.as_deref() == Some(json.as_str()) {
+            return;
+        }
+        match autosession::save_for(&track_path, &session) {
+            Ok(()) => {
+                self.last_autosave_json = Some(json);
+            }
+            Err(e) => {
+                log::warn!("autosession write failed: {e:#}");
             }
         }
     }
@@ -315,6 +408,7 @@ fn clamp_loop(region: Option<LoopRegion>, total_frames: u64) -> Option<LoopRegio
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_decode_results();
+        self.autosave_tick();
 
         // Repaint while decoding (spinner) or while a track is loaded (so the
         // playhead/seek slider update during playback).
@@ -492,5 +586,11 @@ impl eframe::App for App {
                 }
             }
         });
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Final autosave on clean shutdown so unsaved state between
+        // `AUTOSAVE_INTERVAL` ticks isn't lost.
+        self.autosave_flush();
     }
 }

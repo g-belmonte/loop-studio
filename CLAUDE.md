@@ -14,10 +14,9 @@ v0.1 is closed and v0.2 is in flight. Done so far: step 6c (WSOLA quality pass �
 
 Waveform zoom + scroll also landed: `WaveformView { start, len }` on `App`, mapped to pixels by the widget; Ctrl+wheel / pinch / `+`–`-` to zoom, Shift+wheel / right-drag to pan, follow-playhead toggle pages forward when the playhead leaves the view. Not persisted in sessions.
 
-What's queued for the rest of v0.2:
-- Per-track session auto-save.
+Per-track session auto-save also landed: `src/session/auto.rs` resolves a per-track JSON path under `$XDG_DATA_HOME/loop-studio/autosessions/` (FNV-1a hash of the canonical track path → filename); `App::autosave_tick` runs every frame and writes through `autosave_flush` once per `AUTOSAVE_INTERVAL` (2 s) if the serialised JSON changed. `drain_decode_results` flushes the outgoing track before swapping in a new one, and `App::on_exit` flushes one last time on clean shutdown. `open_dialog` consults `autosession::load_for` and pre-loads `PendingRestore` so the existing decode-then-apply path restores settings without any new plumbing.
 
-Ask the user which thread they want before starting — the order isn't determined. Detour clause for 8a/8b: if neither closes the gap on a particular kind of material, Phase 5 (FFI to Rubber Band or signalsmith-stretch) is the escape hatch — the trait shape stays the same.
+With every v0.2 item closed, ask the user which thread they want next. Detour clause for 8a/8b: if neither closes the gap on a particular kind of material, Phase 5 (FFI to Rubber Band or signalsmith-stretch) is the escape hatch — the trait shape stays the same.
 
 ## Commands
 
