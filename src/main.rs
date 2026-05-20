@@ -14,7 +14,7 @@ fn main() -> Result<()> {
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1000.0, 600.0])
+            .with_inner_size([1000.0, 1200.0])
             .with_title("Loop Studio"),
         ..Default::default()
     };
