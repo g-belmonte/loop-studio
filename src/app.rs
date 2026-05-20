@@ -16,13 +16,14 @@ use crate::engine::speed_ramp::SpeedRampSettings;
 use crate::engine::{Command, Engine};
 use crate::session::{Session, auto as autosession};
 use crate::track::peaks::TrackPeaks;
-use crate::track::{LoopRegion, Marker, Track};
+use crate::track::{LoopRegion, Marker, NamedLoop, Track};
+use crate::ui::loops::LoopsAction;
 use crate::ui::metronome::{MetronomeAction, TapTempo};
 use crate::ui::shortcuts::LoopEndpoint;
 use crate::ui::waveform::{WaveformAction, WaveformView};
 use crate::ui::{
-    eq as eq_ui, markers as marker_list, menu, metronome as metronome_ui, shortcuts,
-    speed_ramp as speed_ramp_ui, transport, waveform,
+    eq as eq_ui, loops as loops_ui, markers as marker_list, menu, metronome as metronome_ui,
+    shortcuts, speed_ramp as speed_ramp_ui, transport, waveform,
 };
 
 /// Debounce interval for per-track auto-save. A loaded track is checked once
@@ -62,7 +63,8 @@ struct BpmResult {
 /// by `drain_decode_results` once the matching `LoadResult` lands.
 struct PendingRestore {
     path: PathBuf,
-    loop_region: Option<LoopRegion>,
+    loops: Vec<NamedLoop>,
+    active_loop: Option<usize>,
     speed: f32,
     pitch_semitones: f32,
     last_position: u64,
@@ -78,7 +80,19 @@ pub struct App {
     load_tx: Sender<LoadResult>,
     load_rx: Receiver<LoadResult>,
     engine: Option<Engine>,
+    /// Engine-facing loop region — what the worker is actually looping. May
+    /// reflect a saved loop (when `active_loop` is `Some`) or a one-off
+    /// region the user hasn't saved yet.
     loop_region: Option<LoopRegion>,
+    /// Saved loop slots (UI source of truth). Slot N (1-indexed) =
+    /// `loops[N-1]`, addressed by `Shift+Num1..Num9`. Reset on track load;
+    /// restored from `PendingRestore` on session load.
+    loops: Vec<NamedLoop>,
+    /// Index into `loops` of the slot currently driving `loop_region`. `None`
+    /// when no slot is selected (either no active loop or an unsaved region).
+    /// Edits to `loop_region` while `active_loop` is `Some` auto-sync the
+    /// matching slot so dragging endpoints on a saved loop tweaks it in place.
+    active_loop: Option<usize>,
     /// Currently-selected DSP family (UI source of truth, like `loop_region`).
     /// Survives across track loads; sent to the engine via `Command::SetDsp`
     /// on user change or session restore.
@@ -151,6 +165,8 @@ impl App {
             load_rx,
             engine,
             loop_region: None,
+            loops: Vec::new(),
+            active_loop: None,
             dsp_kind: DspKind::default(),
             pending_restore: None,
             session_error: None,
@@ -186,7 +202,8 @@ impl App {
         {
             self.pending_restore = Some(PendingRestore {
                 path: path.clone(),
-                loop_region: session.loop_region,
+                loops: session.loops,
+                active_loop: session.active_loop,
                 speed: session.speed,
                 pitch_semitones: session.pitch_semitones,
                 last_position: session.last_position,
@@ -287,9 +304,11 @@ impl App {
                         peaks.len(),
                     );
 
-                    // Default: clear the loop region. Overridden below
+                    // Default: clear loops + active region. Overridden below
                     // if a pending session restore matches this path.
                     let mut new_loop = None;
+                    self.loops.clear();
+                    self.active_loop = None;
                     self.view = WaveformView::full(track.frame_count());
 
                     if let Some(engine) = &self.engine {
@@ -302,7 +321,9 @@ impl App {
                         && pending.path == path
                     {
                         let total = track.frame_count();
-                        new_loop = clamp_loop(pending.loop_region, total);
+                        self.loops = clamp_loops(pending.loops, total);
+                        self.active_loop = clamp_active_loop(pending.active_loop, &self.loops);
+                        new_loop = self.active_loop.map(|i| self.loops[i].region());
                         let last_pos = pending.last_position.min(total);
                         self.dsp_kind = pending.dsp_kind;
                         self.markers = clamp_markers(pending.markers, total);
@@ -380,7 +401,8 @@ impl App {
             version: Session::CURRENT_VERSION,
             track_path: track_path.clone(),
             track_sample_rate: track.sample_rate,
-            loop_region: self.loop_region,
+            loops: self.loops.clone(),
+            active_loop: self.active_loop,
             speed: f32::from_bits(state.speed_bits.load(Ordering::Relaxed)),
             pitch_semitones: f32::from_bits(state.pitch_bits.load(Ordering::Relaxed)),
             last_position: state.position.load(Ordering::Relaxed),
@@ -477,7 +499,8 @@ impl App {
         self.session_error = None;
         self.pending_restore = Some(PendingRestore {
             path: session.track_path.clone(),
-            loop_region: session.loop_region,
+            loops: session.loops,
+            active_loop: session.active_loop,
             speed: session.speed,
             pitch_semitones: session.pitch_semitones,
             last_position: session.last_position,
@@ -515,18 +538,25 @@ fn clamp_markers(mut markers: Vec<Marker>, total_frames: u64) -> Vec<Marker> {
     markers
 }
 
-/// Clamp a saved loop region to the loaded track. Drops the loop if the
-/// region is degenerate (start ≥ end after clamp) or starts past end-of-track.
-fn clamp_loop(region: Option<LoopRegion>, total_frames: u64) -> Option<LoopRegion> {
-    let r = region?;
-    if r.start >= total_frames {
-        return None;
-    }
-    let end = r.end.min(total_frames);
-    if r.start >= end {
-        return None;
-    }
-    Some(LoopRegion { start: r.start, end })
+/// Clamp saved loops to the loaded track. Each loop is end-clamped to
+/// `total_frames`; any loop that starts past EOF or collapses to start ≥ end
+/// after clamping is dropped. Order is preserved so slot indices the user
+/// memorised stay stable across reopens (when nothing was clamped away).
+fn clamp_loops(mut loops: Vec<NamedLoop>, total_frames: u64) -> Vec<NamedLoop> {
+    loops.retain_mut(|l| {
+        if l.start >= total_frames {
+            return false;
+        }
+        l.end = l.end.min(total_frames);
+        l.start < l.end
+    });
+    loops
+}
+
+/// Drop a restored `active_loop` index if it's out of range for the
+/// post-clamp `loops` vector.
+fn clamp_active_loop(active: Option<usize>, loops: &[NamedLoop]) -> Option<usize> {
+    active.filter(|&i| i < loops.len())
 }
 
 impl eframe::App for App {
@@ -563,6 +593,8 @@ impl eframe::App for App {
                 total,
                 &mut self.loop_region,
                 &mut self.pending_loop,
+                &mut self.loops,
+                &mut self.active_loop,
                 &mut self.markers,
                 &mut self.view,
                 &mut self.metronome,
@@ -646,6 +678,11 @@ impl eframe::App for App {
                             }
                             WaveformAction::SetLoop(region) => {
                                 self.loop_region = Some(region);
+                                // Defining a region detaches from any saved
+                                // slot — the slot is unchanged, and the user
+                                // is now on a fresh unsaved region they can
+                                // re-Save explicitly.
+                                self.active_loop = None;
                                 engine.send(Command::SetLoop(Some(region)));
                             }
                         }
@@ -683,6 +720,7 @@ impl eframe::App for App {
                                 if ui.button("Clear loop").clicked() {
                                     self.loop_region = None;
                                     self.pending_loop = None;
+                                    self.active_loop = None;
                                     engine.send(Command::SetLoop(None));
                                 }
                             });
@@ -723,6 +761,58 @@ impl eframe::App for App {
                         ui.add_space(8.0);
                         ui.separator();
                         eq_ui::show(ui, &mut self.eq, engine);
+
+                        ui.add_space(8.0);
+                        ui.separator();
+                        let loops_action = loops_ui::show(
+                            ui,
+                            &mut self.loops,
+                            self.active_loop,
+                            self.loop_region,
+                            track.sample_rate,
+                        );
+                        match loops_action {
+                            LoopsAction::None => {}
+                            LoopsAction::Activate(i) => {
+                                if let Some(l) = self.loops.get(i) {
+                                    let region = l.region();
+                                    self.loop_region = Some(region);
+                                    self.active_loop = Some(i);
+                                    self.pending_loop = None;
+                                    engine.send(Command::SetLoop(Some(region)));
+                                }
+                            }
+                            LoopsAction::Delete(i) => {
+                                if i < self.loops.len() {
+                                    self.loops.remove(i);
+                                    // Maintain active_loop pointing at the
+                                    // same slot conceptually: drop it if the
+                                    // deleted row was active, shift it down if
+                                    // a slot before the active one disappeared.
+                                    self.active_loop = match self.active_loop {
+                                        Some(a) if a == i => None,
+                                        Some(a) if a > i => Some(a - 1),
+                                        other => other,
+                                    };
+                                    if self.active_loop.is_none() {
+                                        self.loop_region = None;
+                                        engine.send(Command::SetLoop(None));
+                                    }
+                                }
+                            }
+                            LoopsAction::SaveCurrent => {
+                                if let Some(r) = self.loop_region
+                                    && self.loops.len() < 9
+                                {
+                                    self.loops.push(NamedLoop {
+                                        start: r.start,
+                                        end: r.end,
+                                        label: String::new(),
+                                    });
+                                    self.active_loop = Some(self.loops.len() - 1);
+                                }
+                            }
+                        }
 
                         ui.add_space(8.0);
                         ui.separator();

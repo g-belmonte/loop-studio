@@ -1,4 +1,5 @@
 pub mod eq;
+pub mod loops;
 pub mod markers;
 pub mod menu;
 pub mod metronome;

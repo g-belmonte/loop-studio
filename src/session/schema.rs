@@ -7,14 +7,15 @@ use crate::dsp::DspKind;
 use crate::dsp::eq::EqSettings;
 use crate::engine::metronome::MetronomeSettings;
 use crate::engine::speed_ramp::SpeedRampSettings;
-use crate::track::{LoopRegion, Marker};
+use crate::track::{Marker, NamedLoop};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub version: u32,
     pub track_path: PathBuf,
     pub track_sample_rate: u32,
-    pub loop_region: Option<LoopRegion>,
+    pub loops: Vec<NamedLoop>,
+    pub active_loop: Option<usize>,
     pub speed: f32,
     pub pitch_semitones: f32,
     pub last_position: u64,
@@ -26,7 +27,7 @@ pub struct Session {
 }
 
 impl Session {
-    pub const CURRENT_VERSION: u32 = 6;
+    pub const CURRENT_VERSION: u32 = 7;
 
     pub fn save(&self, path: &Path) -> Result<()> {
         let json = serde_json::to_string_pretty(self).context("serialising session")?;

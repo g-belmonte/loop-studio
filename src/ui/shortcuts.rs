@@ -4,7 +4,7 @@ use egui::{Key, Modifiers};
 
 use crate::engine::metronome::MetronomeSettings;
 use crate::engine::{Command, Engine};
-use crate::track::{LoopRegion, Marker};
+use crate::track::{LoopRegion, Marker, NamedLoop};
 use crate::ui::metronome::TapTempo;
 use crate::ui::waveform::{self, WaveformView};
 
@@ -35,6 +35,8 @@ pub fn handle(
     total_frames: u64,
     loop_region: &mut Option<LoopRegion>,
     pending_loop: &mut Option<LoopEndpoint>,
+    loops: &mut [NamedLoop],
+    active_loop: &mut Option<usize>,
     markers: &mut Vec<Marker>,
     view: &mut WaveformView,
     metronome: &mut MetronomeSettings,
@@ -91,15 +93,29 @@ pub fn handle(
             if loop_region.is_some() {
                 engine.send(Command::SetLoop(None));
                 *loop_region = None;
+                // Deselect the saved slot but keep the saved list intact.
+                *active_loop = None;
             }
             *pending_loop = None;
         }
 
         if i.consume_key(Modifiers::NONE, Key::OpenBracket) {
-            apply_endpoint(LoopEndpoint::Start(position), loop_region, pending_loop, engine);
+            apply_endpoint(
+                LoopEndpoint::Start(position),
+                loop_region,
+                pending_loop,
+                active_loop,
+                engine,
+            );
         }
         if i.consume_key(Modifiers::NONE, Key::CloseBracket) {
-            apply_endpoint(LoopEndpoint::End(position), loop_region, pending_loop, engine);
+            apply_endpoint(
+                LoopEndpoint::End(position),
+                loop_region,
+                pending_loop,
+                active_loop,
+                engine,
+            );
         }
 
         // M: drop a marker at the current playhead. Duplicate-frame presses are
@@ -132,11 +148,23 @@ pub fn handle(
 
         // 1..9: jump to the Nth marker (1-indexed). Beyond 9 markers the
         // extras have no shortcut — use Ctrl+arrows or the side list.
+        // Shift+1..9: activate the Nth saved loop. Empty slot is a no-op
+        // (mirrors how marker jumps no-op past the end of the marker list).
         const NUMS: [Key; 9] = [
             Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5,
             Key::Num6, Key::Num7, Key::Num8, Key::Num9,
         ];
         for (idx, key) in NUMS.iter().enumerate() {
+            if i.consume_key(Modifiers::SHIFT, *key) {
+                if let Some(l) = loops.get(idx) {
+                    let region = l.region();
+                    *loop_region = Some(region);
+                    *active_loop = Some(idx);
+                    *pending_loop = None;
+                    engine.send(Command::SetLoop(Some(region)));
+                }
+                continue;
+            }
             if i.consume_key(Modifiers::NONE, *key)
                 && let Some(m) = markers.get(idx)
             {
@@ -205,6 +233,7 @@ fn apply_endpoint(
     new: LoopEndpoint,
     loop_region: &mut Option<LoopRegion>,
     pending_loop: &mut Option<LoopEndpoint>,
+    active_loop: &mut Option<usize>,
     engine: &Engine,
 ) {
     if let Some(active) = *loop_region {
@@ -212,14 +241,14 @@ fn apply_endpoint(
             LoopEndpoint::Start(s) => (s, active.end),
             LoopEndpoint::End(e) => (active.start, e),
         };
-        commit(a, b, loop_region, pending_loop, engine);
+        commit(a, b, loop_region, pending_loop, active_loop, engine);
         return;
     }
 
     match (*pending_loop, new) {
         (Some(LoopEndpoint::End(e)), LoopEndpoint::Start(s))
         | (Some(LoopEndpoint::Start(s)), LoopEndpoint::End(e)) => {
-            commit(s, e, loop_region, pending_loop, engine);
+            commit(s, e, loop_region, pending_loop, active_loop, engine);
         }
         _ => {
             *pending_loop = Some(new);
@@ -232,6 +261,7 @@ fn commit(
     b: u64,
     loop_region: &mut Option<LoopRegion>,
     pending_loop: &mut Option<LoopEndpoint>,
+    active_loop: &mut Option<usize>,
     engine: &Engine,
 ) {
     let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
@@ -239,6 +269,11 @@ fn commit(
         let region = LoopRegion { start: lo, end: hi };
         *loop_region = Some(region);
         *pending_loop = None;
+        // Defining a new region (or moving an endpoint of the active one)
+        // detaches from any saved slot — the slot itself stays unchanged
+        // and the user is now on a fresh, unsaved region. Re-Save to slot
+        // the new region, or Shift+N to switch back.
+        *active_loop = None;
         engine.send(Command::SetLoop(Some(region)));
     }
 }

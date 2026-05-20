@@ -99,7 +99,8 @@ src/
     ├── mod.rs
     ├── transport.rs     # play/pause/seek/speed/pitch widgets
     ├── waveform.rs      # custom egui widget: peaks + playhead + loop region + markers + view (zoom/scroll)
-    ├── shortcuts.rs     # global keyboard handler (space/arrows/[/]/Esc/Home/End/M/T/1-9/+/-)
+    ├── shortcuts.rs     # global keyboard handler (space/arrows/[/]/Esc/Home/End/M/T/1-9/Shift+1-9/+/-)
+    ├── loops.rs         # saved-loops side list (Save / activate / label edit / delete)
     ├── markers.rs       # marker side list (seek button + label edit + delete)
     ├── metronome.rs     # metronome row (toggle/BPM/Tap/accent/beats/volume) + tap-tempo accumulator
     ├── eq.rs            # EQ panel (enable + 5 band columns: gain slider + solo button)
@@ -271,14 +272,18 @@ Cost: one extra pass through `NUM_BINS` per channel for transient detection, two
 
 ## Session format
 
-Versioned from day one so we can migrate without breaking saved sessions. Each release bumps the version when fields change: v2 added `dsp_kind`, v3 added `markers`, v4 added `metronome`, v5 added `eq`, v6 adds `speed_ramp`. While the project is in alpha (pre-v0.1 release), `Session::load` only accepts `version == CURRENT_VERSION` — older sessions are rejected outright rather than carrying forward `#[serde(default)]` shims. Backward-compat migrations land when we ship a release. The current schema:
+Versioned from day one so we can migrate without breaking saved sessions. Each release bumps the version when fields change: v2 added `dsp_kind`, v3 added `markers`, v4 added `metronome`, v5 added `eq`, v6 added `speed_ramp`, v7 replaces `loop_region` with `loops` + `active_loop`. While the project is in alpha (pre-v0.1 release), `Session::load` only accepts `version == CURRENT_VERSION` — older sessions are rejected outright rather than carrying forward `#[serde(default)]` shims. Backward-compat migrations land when we ship a release. The current schema:
 
 ```json
 {
-  "version": 6,
+  "version": 7,
   "track_path": "/home/me/music/song.flac",
   "track_sample_rate": 44100,
-  "loop_region": { "start": 1234567, "end": 2345678 },
+  "loops": [
+    { "start": 1234567, "end": 2345678, "label": "chorus" },
+    { "start": 3000000, "end": 3500000, "label": "" }
+  ],
+  "active_loop": 0,
   "speed": 0.75,
   "pitch_semitones": -2.0,
   "last_position": 1500000,
@@ -411,6 +416,11 @@ Versioned from day one so we can migrate without breaking saved sessions. Each r
 
   Persisted in session schema v6 (`speed_ramp: SpeedRampSettings`). `SetSpeedRamp` lands between `SetMetronome` and `SetLoop` on restore so the engine's first wrap on this track is counted against the restored ramp config, not a default. Considered and rejected: linear interpolation over N total passes (count-based) — fixed step is what a player actually thinks in ("add 5%"); per-loop persistent count surviving across sessions (the wrap counter is engine-local and there's no need to survive a reopen); auto-disable when target is reached (no — let the user widen the target and resume); driving the ramp from wall-clock seconds (decouples from the practice unit and skews when speed itself changes the loop duration).
 - **Master output volume** (decided v0.3). `App::master_volume_db: f32` (UI source of truth, default 0 dB) drives a slider in `ui::transport`; on change the UI sends `Command::SetMasterVolume(db)`. The worker holds `master_current_gain` / `master_target_gain` (linear); `apply_master_gain` runs after the metronome mix and before `producer.push_slice`, linearly ramping current → target across the chunk so fast slider drags don't zipper. At steady state we skip multiplication entirely when target is unity (the common case) and apply a constant scalar otherwise. Range -60..=+6 dB; -60 is the floor (~0.001×), +6 is headroom that can clip on already-hot material. Applied **post**-metronome so the slider behaves like a true output fader and the metronome's own `volume_db` stays a relative trim. **Not persisted** in sessions — resets to 0 dB on every app launch (a per-track loudness offset is a separate problem; lumping it into the per-track autosession would tie the master slider to whichever track loaded last, which is the wrong mental model for "output fader"). Considered and rejected: applying pre-metronome (decouples the master from the click); a linear-percent or 0..2× scale (dB matches musician intuition and the existing metronome slider); per-track persistence (see above); a soft-knee limiter on the +6 dB top end (skip until clipping is shown to bite real material).
+- **Multiple saved loops** (decided v0.3). `App::loops: Vec<NamedLoop>` carries up to 9 saved slots (UI source of truth, parallel to `markers`) and `App::active_loop: Option<usize>` indexes the slot currently driving `loop_region`. Engine state is unchanged — `Command::SetLoop(Option<LoopRegion>)` already swaps the active region atomically, so multiplexing is purely a UI concern; the worker never sees the slot list. `Shift+Num1..Num9` in `ui::shortcuts` activates the Nth slot (empty = no-op, mirroring `Num1..Num9`'s behaviour past the end of the marker list — the bare number row stays exclusively for markers).
+
+  **Saved slots are immutable from region edits**: defining a new region — via waveform drag *or* via `[`/`]` on an existing active loop — clears `active_loop` and leaves the saved slot's stored `start`/`end` untouched. The new region is a fresh unsaved one the user can re-Save (creating another slot) or discard. Mirroring endpoint edits back into the slot was rejected because the user's mental model is that a saved slot is a *named bookmark*: dragging the boundary after recall feels like "I'm trying a different region", not "I'm redefining the bookmark". Without the mirror, the only way to mutate a slot's contents is delete + re-save, which is the explicit affordance.
+
+  `Esc` and the "Clear loop" button clear both `loop_region` and `active_loop` but leave the saved list intact — the slot survives a brief "no loop" detour. The slot limit is 9, capped by the shortcut surface; an autosession that somehow carries more keeps the first 9 after `clamp_loops` (in practice the UI never lets it exceed). Session schema v7 (`loops: Vec<NamedLoop>`, `active_loop: Option<usize>`) replaces `loop_region` outright; the v7 bump is a hard break in alpha, no v6 migration shim. Considered and rejected: queued switching that waits for the current loop to wrap before swapping (`SetLoop` already snaps instantly via `snap_into_loop`, and a pending-loop shadow on the engine adds a second state machine for a UX win that's marginal at most tempos); auto-appending every committed `[`/`]` region to the list (list churns with throwaway selections, and "Save" is one click); mirroring endpoint edits into the active slot (see above — bookmarks should stay where the user put them).
 - **Lenient session loading at the boundary** (decided v0.1 step 7). Saved sessions are validated only where the data could actually be wrong: the loop region is clamped to `[0, track_frame_count)` and dropped if degenerate (`start ≥ end` after clamping); `last_position` is clamped to track length; speed and pitch are passed through to the engine, which clamps them itself. The `version` field is checked strictly — any value other than `Session::CURRENT_VERSION = 1` errors out. A missing track file surfaces through the existing decode-failure path (`LoadStatus::Failed`) and clears the pending restore. JSON parse errors and write failures bubble up to a `session_error` line in the UI.
 
 ## Open questions

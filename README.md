@@ -62,6 +62,7 @@ See [ARCHITECTURE.md](./ARCHITECTURE.md#decisions) for the design notes behind e
 - [x] **Click track / metronome** synced to a tap-set tempo (source-frame anchored at the loop start, optional accent + beats/measure, BPM via tap / `T` key / number entry, mixed post-DSP into the engine output).
 - [x] **Master volume** slider (dB, -60 → +6, applied post-metronome with a per-chunk linear ramp; not persisted in sessions).
 - [x] **BPM detection** — on-demand button in the metronome row that estimates the tempo of the loop region (or whole track) via spectral-flux onset + autocorrelation. Runs on a worker thread; result lands behind a "Use" button that copies the value into the metronome.
+- [x] **Multiple saved loops** — up to 9 named slots per track, switched instantly via `Shift+1..9` (markers keep the bare number row). Side list with Save / activate / rename / delete; defining a new region (drag or `[`/`]`) detaches from the active slot and leaves it unchanged.
 - [ ] Export looped section as audio.
 
 ### Later

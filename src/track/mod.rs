@@ -17,6 +17,25 @@ pub struct Marker {
     pub label: String,
 }
 
+/// A saved loop slot held by `App::loops`. Order in the Vec is the slot index
+/// the `Shift+1..9` shortcuts target (slot N = `loops[N-1]`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NamedLoop {
+    pub start: u64,
+    pub end: u64,
+    #[serde(default)]
+    pub label: String,
+}
+
+impl NamedLoop {
+    pub fn region(&self) -> LoopRegion {
+        LoopRegion {
+            start: self.start,
+            end: self.end,
+        }
+    }
+}
+
 pub struct Track {
     pub samples: Vec<f32>,   // interleaved
     pub sample_rate: u32,
