@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use eframe::CreationContext;
 
+use crate::analysis::bpm::{self, BpmStatus};
 use crate::audio::decoder;
 use crate::dsp::DspKind;
 use crate::dsp::eq::EqSettings;
@@ -15,7 +16,7 @@ use crate::engine::{Command, Engine};
 use crate::session::{Session, auto as autosession};
 use crate::track::peaks::TrackPeaks;
 use crate::track::{LoopRegion, Marker, Track};
-use crate::ui::metronome::TapTempo;
+use crate::ui::metronome::{MetronomeAction, TapTempo};
 use crate::ui::shortcuts::LoopEndpoint;
 use crate::ui::waveform::{WaveformAction, WaveformView};
 use crate::ui::{
@@ -46,6 +47,13 @@ enum LoadStatus {
 struct LoadResult {
     path: PathBuf,
     result: anyhow::Result<(Arc<Track>, Arc<TrackPeaks>)>,
+}
+
+/// Result of a one-shot BPM-detection worker. The path lets `App` discard
+/// stale results that landed after the user moved on to a different track.
+struct BpmResult {
+    path: PathBuf,
+    bpm: Option<f32>,
 }
 
 /// State to apply *after* an in-flight decode finishes, when the user opened
@@ -113,11 +121,17 @@ pub struct App {
     /// a cheap dirty-check: if `build_session()` re-serialises to the same
     /// bytes, the on-disk file is already up to date and we skip the write.
     last_autosave_json: Option<String>,
+    /// BPM detection state for the currently loaded track. Reset to `Idle`
+    /// on every load; never persisted.
+    bpm_status: BpmStatus,
+    bpm_tx: Sender<BpmResult>,
+    bpm_rx: Receiver<BpmResult>,
 }
 
 impl App {
     pub fn new(_cc: &CreationContext<'_>) -> Self {
         let (load_tx, load_rx) = unbounded();
+        let (bpm_tx, bpm_rx) = unbounded();
         let engine = match Engine::spawn() {
             Ok(e) => Some(e),
             Err(e) => {
@@ -146,6 +160,9 @@ impl App {
             follow_playhead: true,
             last_autosave_at: None,
             last_autosave_json: None,
+            bpm_status: BpmStatus::Idle,
+            bpm_tx,
+            bpm_rx,
         }
     }
 
@@ -188,6 +205,47 @@ impl App {
         });
     }
 
+    /// Drain BPM-detection results from the worker channel. Stale results
+    /// (path mismatch — the user switched tracks while detection was running)
+    /// are dropped on the floor; only a result whose path matches the current
+    /// `Loaded` track updates `bpm_status`.
+    fn drain_bpm_results(&mut self) {
+        while let Ok(BpmResult { path, bpm }) = self.bpm_rx.try_recv() {
+            let matches = matches!(&self.status, LoadStatus::Loaded { path: cur, .. } if cur == &path);
+            if !matches {
+                continue;
+            }
+            self.bpm_status = match bpm {
+                Some(b) => BpmStatus::Done(b),
+                None => BpmStatus::Failed,
+            };
+        }
+    }
+
+    /// Kick off a BPM-detection worker for the currently loaded track over the
+    /// active loop region (or the whole track if no loop is set). No-op when
+    /// no track is loaded or a detection is already running.
+    fn spawn_bpm_detect(&mut self) {
+        if matches!(self.bpm_status, BpmStatus::Running) {
+            return;
+        }
+        let LoadStatus::Loaded { path, track, .. } = &self.status else {
+            return;
+        };
+        let path = path.clone();
+        let track = track.clone();
+        let (start, end) = match self.loop_region {
+            Some(r) => (r.start, r.end),
+            None => (0, track.frame_count()),
+        };
+        self.bpm_status = BpmStatus::Running;
+        let tx = self.bpm_tx.clone();
+        thread::spawn(move || {
+            let bpm = bpm::detect_bpm(&track, start, end);
+            let _ = tx.send(BpmResult { path, bpm });
+        });
+    }
+
     fn drain_decode_results(&mut self) {
         while let Ok(LoadResult { path, result }) = self.load_rx.try_recv() {
             // Flush the outgoing track's state before we hand the engine a
@@ -204,6 +262,9 @@ impl App {
             self.last_autosave_at = Some(Instant::now());
             // Any [/] press from a previous track has no meaning here.
             self.pending_loop = None;
+            // Detection isn't persisted — every new track starts unanalysed.
+            // A late result for the old track is ignored in `drain_bpm_results`.
+            self.bpm_status = BpmStatus::Idle;
             // Clear markers by default; the session-restore branch below
             // repopulates them if the matching pending restore lands.
             self.markers.clear();
@@ -456,7 +517,11 @@ fn clamp_loop(region: Option<LoopRegion>, total_frames: u64) -> Option<LoopRegio
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_decode_results();
+        self.drain_bpm_results();
         self.autosave_tick();
+        // Surfaced from inside the central panel's closure (which holds a
+        // mutable borrow of `self`); acted on after the borrow ends.
+        let mut metronome_action = MetronomeAction::None;
 
         // Repaint while decoding (spinner) or while a track is loaded (so the
         // playhead/seek slider update during playback).
@@ -622,7 +687,13 @@ impl eframe::App for App {
 
                         ui.add_space(8.0);
                         ui.separator();
-                        metronome_ui::show(ui, &mut self.metronome, &mut self.tap_tempo, engine);
+                        metronome_action = metronome_ui::show(
+                            ui,
+                            &mut self.metronome,
+                            &mut self.tap_tempo,
+                            engine,
+                            &self.bpm_status,
+                        );
 
                         ui.add_space(8.0);
                         ui.separator();
@@ -645,6 +716,10 @@ impl eframe::App for App {
                 }
             }
         });
+
+        if metronome_action == MetronomeAction::DetectBpm {
+            self.spawn_bpm_detect();
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {

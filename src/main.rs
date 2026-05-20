@@ -1,3 +1,4 @@
+mod analysis;
 mod app;
 mod audio;
 mod dsp;

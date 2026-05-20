@@ -1,8 +1,19 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+use crate::analysis::bpm::BpmStatus;
 use crate::engine::metronome::{MAX_BPM, MIN_BPM, MetronomeSettings};
 use crate::engine::{Command, Engine};
+
+/// User intent surfaced from the metronome row back to `App`. Only the
+/// "kick off detection" branch needs the caller — copying a detected BPM
+/// into the metronome is handled in `show` directly (same path as the Tap
+/// button), so it doesn't need a round-trip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetronomeAction {
+    None,
+    DetectBpm,
+}
 
 /// Rolling tap-tempo state. Lives in `App`; entirely GUI-side.
 ///
@@ -66,13 +77,19 @@ impl TapTempo {
 /// toggle, beats-per-measure spinner, and volume slider. Anything that
 /// changes the engine-relevant state results in a single
 /// `Command::SetMetronome(settings)` send at the end.
+///
+/// Also renders BPM-detection controls (Detect button + status). Detection
+/// itself runs on a worker thread owned by `App`, so the only way for the
+/// user to start one is the returned `MetronomeAction::DetectBpm`.
 pub fn show(
     ui: &mut egui::Ui,
     settings: &mut MetronomeSettings,
     tap: &mut TapTempo,
     engine: &Engine,
-) {
+    bpm_status: &BpmStatus,
+) -> MetronomeAction {
     let before = *settings;
+    let mut action = MetronomeAction::None;
 
     ui.horizontal(|ui| {
         ui.checkbox(&mut settings.enabled, "Metronome");
@@ -90,6 +107,37 @@ pub fn show(
                 && let Some(bpm) = tap.tap()
             {
                 settings.bpm = bpm;
+            }
+            // Detect / Use lives next to Tap so the three "set the BPM"
+            // affordances are visually grouped.
+            let running = matches!(bpm_status, BpmStatus::Running);
+            if ui
+                .add_enabled(!running, egui::Button::new("Detect"))
+                .on_hover_text(
+                    "Estimate the BPM of the loop region (or whole track if no loop is set)",
+                )
+                .clicked()
+            {
+                action = MetronomeAction::DetectBpm;
+            }
+            match bpm_status {
+                BpmStatus::Idle => {}
+                BpmStatus::Running => {
+                    ui.spinner();
+                }
+                BpmStatus::Done(b) => {
+                    ui.label(format!("{} BPM", b.round() as i32));
+                    if ui
+                        .button("Use")
+                        .on_hover_text("Copy the detected BPM into the metronome")
+                        .clicked()
+                    {
+                        settings.bpm = b.clamp(MIN_BPM, MAX_BPM);
+                    }
+                }
+                BpmStatus::Failed => {
+                    ui.label("no tempo found");
+                }
             }
             ui.checkbox(&mut settings.accent, "Accent");
             ui.add_enabled_ui(settings.accent, |ui| {
@@ -118,4 +166,6 @@ pub fn show(
     if *settings != before {
         engine.send(Command::SetMetronome(*settings));
     }
+
+    action
 }
