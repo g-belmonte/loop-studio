@@ -27,6 +27,20 @@ pub fn pick_session_save(default_name: &str, default_dir: Option<&Path>) -> Opti
     dialog.save_file()
 }
 
+/// Save dialog for the WAV export. Default name + parent dir come from the
+/// loaded track so the export lands next to the source file by default.
+pub fn pick_wav_save(default_name: &str, default_dir: Option<&Path>) -> Option<PathBuf> {
+    let mut dialog = rfd::FileDialog::new()
+        .add_filter("WAV", &["wav"])
+        .add_filter("All files", &["*"])
+        .set_title("Export loop as WAV")
+        .set_file_name(default_name);
+    if let Some(dir) = default_dir {
+        dialog = dialog.set_directory(dir);
+    }
+    dialog.save_file()
+}
+
 pub fn pick_session_open() -> Option<PathBuf> {
     rfd::FileDialog::new()
         .add_filter("Loop Studio session", &["json"])

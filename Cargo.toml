@@ -14,6 +14,9 @@ egui = "0.29"
 cpal = "0.15"
 symphonia = { version = "0.5", features = ["mp3", "flac", "vorbis", "wav", "aac", "isomp4"] }
 
+# WAV encoding for loop export (src/render/mod.rs)
+hound = "3"
+
 # DSP building blocks (resampling; time-stretch/pitch-shift impl TBD — see ARCHITECTURE.md)
 rubato = "0.16"
 

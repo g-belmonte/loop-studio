@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::thread;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -14,6 +14,7 @@ use crate::dsp::eq::EqSettings;
 use crate::engine::metronome::MetronomeSettings;
 use crate::engine::speed_ramp::SpeedRampSettings;
 use crate::engine::{Command, Engine};
+use crate::render::{self, ExportFormat, RenderProgress, RenderRequest};
 use crate::session::{Session, auto as autosession};
 use crate::track::peaks::TrackPeaks;
 use crate::track::{LoopRegion, Marker, NamedLoop, Track};
@@ -146,12 +147,48 @@ pub struct App {
     bpm_status: BpmStatus,
     bpm_tx: Sender<BpmResult>,
     bpm_rx: Receiver<BpmResult>,
+    /// Loop-export state. `Idle` outside of a render; `Running` when a worker
+    /// is in flight. Not persisted in sessions — every launch starts Idle.
+    render_status: RenderStatus,
+    render_tx: Sender<RenderProgress>,
+    render_rx: Receiver<RenderProgress>,
+    /// Shared with the render worker. Set by the Cancel button or `on_exit`;
+    /// the worker polls it once per chunk and bails, cleaning up the `.part`
+    /// file before exit. New `AtomicBool` per render so a stale flag from a
+    /// previous cancel doesn't poison the next job.
+    render_cancel: Option<Arc<AtomicBool>>,
+    /// `JoinHandle` for the in-flight render. Held so `on_exit` can join
+    /// briefly after setting the cancel flag, giving the worker a chance to
+    /// delete the `.part` file before the process exits.
+    render_join: Option<JoinHandle<()>>,
+    /// Monotonic id tagged on each `RenderRequest`. Used by `drain_render_results`
+    /// to drop progress events from a cancelled-and-replaced job (currently
+    /// can't happen — the menu item is disabled while a render runs — but
+    /// trivially cheap, and matches how `bpm_status` tolerates late results).
+    render_job_seq: u64,
+    /// Format chosen in the export dialog (sticky across exports within one
+    /// session). Default `Pcm16` — most universally compatible.
+    export_format: ExportFormat,
+    /// Whether the next export bakes in the metronome. Sticky too. Default
+    /// `false` because the typical export is "this loop as audio", not "this
+    /// loop with a click for practice".
+    export_include_metronome: bool,
+}
+
+#[derive(Debug, Clone)]
+enum RenderStatus {
+    Idle,
+    Running { fraction: f32, out_path: PathBuf },
+    Done { out_path: PathBuf },
+    Failed { error: String },
+    Cancelled,
 }
 
 impl App {
     pub fn new(_cc: &CreationContext<'_>) -> Self {
         let (load_tx, load_rx) = unbounded();
         let (bpm_tx, bpm_rx) = unbounded();
+        let (render_tx, render_rx) = unbounded();
         let engine = match Engine::spawn() {
             Ok(e) => Some(e),
             Err(e) => {
@@ -186,6 +223,14 @@ impl App {
             bpm_status: BpmStatus::Idle,
             bpm_tx,
             bpm_rx,
+            render_status: RenderStatus::Idle,
+            render_tx,
+            render_rx,
+            render_cancel: None,
+            render_join: None,
+            render_job_seq: 0,
+            export_format: ExportFormat::Pcm16,
+            export_include_metronome: false,
         }
     }
 
@@ -269,6 +314,122 @@ impl App {
             let bpm = bpm::detect_bpm(&track, start, end);
             let _ = tx.send(BpmResult { path, bpm });
         });
+    }
+
+    /// Drain progress events from the render worker. Stale events (a stray
+    /// late-arriving message from a previously cancelled job that we no
+    /// longer track) are dropped on the floor by matching `job_id`. Terminal
+    /// events (`Done` / `Failed` / `Cancelled`) clear `render_join` and
+    /// `render_cancel` so the next export starts fresh.
+    fn drain_render_results(&mut self) {
+        while let Ok(ev) = self.render_rx.try_recv() {
+            let ev_job = render_progress_job_id(&ev);
+            if Some(ev_job) != self.current_render_job() {
+                continue;
+            }
+            match ev {
+                RenderProgress::Started { .. } => {
+                    // Status was set to Running by spawn_render before the
+                    // worker even reported Started; nothing to do.
+                }
+                RenderProgress::Progress { fraction, .. } => {
+                    if let RenderStatus::Running { fraction: f, .. } = &mut self.render_status {
+                        *f = fraction;
+                    }
+                }
+                RenderProgress::Done { out_path, .. } => {
+                    log::info!("exported loop to {}", out_path.display());
+                    self.render_status = RenderStatus::Done { out_path };
+                    self.render_join = None;
+                    self.render_cancel = None;
+                }
+                RenderProgress::Failed { error, .. } => {
+                    log::warn!("export failed: {error}");
+                    self.render_status = RenderStatus::Failed { error };
+                    self.render_join = None;
+                    self.render_cancel = None;
+                }
+                RenderProgress::Cancelled { .. } => {
+                    self.render_status = RenderStatus::Cancelled;
+                    self.render_join = None;
+                    self.render_cancel = None;
+                }
+            }
+        }
+    }
+
+    /// Job id we're currently tracking. `None` when no render is in flight —
+    /// any event that lands while `render_join` is empty is by definition
+    /// stale (terminal event already consumed) and gets discarded above.
+    fn current_render_job(&self) -> Option<u64> {
+        self.render_join.as_ref().map(|_| self.render_job_seq)
+    }
+
+    /// Walk the file dialog and start a render. Lives on `App` (not in a
+    /// closure) so it can borrow `self` mutably across both the dialog open
+    /// and the spawn — the menu's closure can't do that itself.
+    fn start_export(&mut self, _ctx: &egui::Context) {
+        let LoadStatus::Loaded { path, .. } = &self.status else {
+            return;
+        };
+        let default_name = path
+            .file_stem()
+            .map(|s| format!("{} (loop).wav", s.to_string_lossy()))
+            .unwrap_or_else(|| "loop.wav".into());
+        let default_dir = path.parent();
+        let Some(out_path) = menu::pick_wav_save(&default_name, default_dir) else {
+            return;
+        };
+        self.spawn_render(out_path);
+    }
+
+    /// Kick off a render of the current loop region. Caller is expected to
+    /// have already collected the save path and to enforce the
+    /// "only-one-render-at-a-time" UX (menu item disabled when running).
+    fn spawn_render(&mut self, out_path: PathBuf) {
+        let (LoadStatus::Loaded { track, .. }, Some(engine), Some(loop_region)) =
+            (&self.status, self.engine.as_ref(), self.loop_region)
+        else {
+            return;
+        };
+        if matches!(self.render_status, RenderStatus::Running { .. }) {
+            return;
+        }
+        let state = engine.state();
+        let speed = f32::from_bits(state.speed_bits.load(Ordering::Relaxed));
+        let pitch = f32::from_bits(state.pitch_bits.load(Ordering::Relaxed));
+
+        self.render_job_seq = self.render_job_seq.wrapping_add(1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let req = RenderRequest {
+            track: track.clone(),
+            loop_region,
+            dsp_kind: self.dsp_kind,
+            speed,
+            pitch_semitones: pitch,
+            eq: self.eq,
+            include_metronome: self.export_include_metronome,
+            metronome: self.metronome,
+            out_path: out_path.clone(),
+            format: self.export_format,
+            job_id: self.render_job_seq,
+        };
+        let join = render::spawn(req, self.render_tx.clone(), cancel.clone());
+        self.render_cancel = Some(cancel);
+        self.render_join = Some(join);
+        self.render_status = RenderStatus::Running {
+            fraction: 0.0,
+            out_path,
+        };
+    }
+
+    /// Signal cancel + drop our handles. The worker observes the flag on its
+    /// next chunk boundary, deletes its `.part` file, and emits a Cancelled
+    /// event we'll see on the next `drain_render_results` tick.
+    fn cancel_render(&mut self) {
+        if let Some(flag) = &self.render_cancel {
+            flag.store(true, Ordering::Relaxed);
+        }
     }
 
     fn drain_decode_results(&mut self) {
@@ -514,6 +675,16 @@ impl App {
     }
 }
 
+fn render_progress_job_id(ev: &RenderProgress) -> u64 {
+    match *ev {
+        RenderProgress::Started { job_id }
+        | RenderProgress::Progress { job_id, .. }
+        | RenderProgress::Done { job_id, .. }
+        | RenderProgress::Failed { job_id, .. }
+        | RenderProgress::Cancelled { job_id } => job_id,
+    }
+}
+
 /// Clamp markers from a session to the loaded track. Drops any whose frame
 /// is past end-of-track, sorts by frame, and dedupes exact-frame collisions
 /// (keeping the first label).
@@ -563,10 +734,13 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_decode_results();
         self.drain_bpm_results();
+        self.drain_render_results();
         self.autosave_tick();
         // Surfaced from inside the central panel's closure (which holds a
         // mutable borrow of `self`); acted on after the borrow ends.
         let mut metronome_action = MetronomeAction::None;
+        let mut cancel_render_clicked = false;
+        let mut dismiss_render_clicked = false;
 
         // Repaint while decoding (spinner) or while a track is loaded (so the
         // playhead/seek slider update during playback).
@@ -602,6 +776,10 @@ impl eframe::App for App {
             );
         }
 
+        // Surfaced from inside the File menu's closure (which borrows `self`
+        // mutably via the menu button); acted on after the borrow ends.
+        let mut export_clicked = false;
+
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
@@ -622,9 +800,49 @@ impl eframe::App for App {
                         ui.close_menu();
                         self.load_session(ctx);
                     }
+                    ui.separator();
+
+                    // Export submenu — bundles format radios, metronome
+                    // checkbox, and the "Choose file…" button so all of the
+                    // per-export decisions live in one place. Disabled when
+                    // there's no loop active (nothing to export) or a render
+                    // is already running (one job at a time, per the design
+                    // call).
+                    let can_export = track_loaded
+                        && self.loop_region.is_some()
+                        && !matches!(self.render_status, RenderStatus::Running { .. });
+                    ui.add_enabled_ui(can_export, |ui| {
+                        ui.menu_button("Export Loop as WAV…", |ui| {
+                            ui.label("Format");
+                            ui.radio_value(
+                                &mut self.export_format,
+                                ExportFormat::Pcm16,
+                                "16-bit PCM",
+                            );
+                            ui.radio_value(
+                                &mut self.export_format,
+                                ExportFormat::F32,
+                                "32-bit float",
+                            );
+                            ui.separator();
+                            ui.checkbox(
+                                &mut self.export_include_metronome,
+                                "Bake in metronome",
+                            );
+                            ui.separator();
+                            if ui.button("Choose file & export…").clicked() {
+                                ui.close_menu();
+                                export_clicked = true;
+                            }
+                        });
+                    });
                 });
             });
         });
+
+        if export_clicked {
+            self.start_export(ctx);
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Loop Studio");
@@ -724,6 +942,56 @@ impl eframe::App for App {
                                     engine.send(Command::SetLoop(None));
                                 }
                             });
+                        }
+
+                        // Surface the render lifecycle: in-progress shows a
+                        // progress fraction + Cancel; terminal states linger
+                        // until the user dismisses them with ✕. Buttons set
+                        // outer flags rather than mutating self directly,
+                        // because the surrounding match holds an immutable
+                        // borrow of `self.status`.
+                        match &self.render_status {
+                            RenderStatus::Idle => {}
+                            RenderStatus::Running { fraction, out_path } => {
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    ui.label(format!(
+                                        "Exporting to {}… {:.0} %",
+                                        out_path.display(),
+                                        (fraction * 100.0).clamp(0.0, 100.0)
+                                    ));
+                                    if ui.button("Cancel").clicked() {
+                                        cancel_render_clicked = true;
+                                    }
+                                });
+                            }
+                            RenderStatus::Done { out_path } => {
+                                ui.horizontal(|ui| {
+                                    ui.label(format!("Exported to {}", out_path.display()));
+                                    if ui.small_button("✕").clicked() {
+                                        dismiss_render_clicked = true;
+                                    }
+                                });
+                            }
+                            RenderStatus::Failed { error } => {
+                                ui.horizontal(|ui| {
+                                    ui.colored_label(
+                                        egui::Color32::LIGHT_RED,
+                                        format!("Export failed: {error}"),
+                                    );
+                                    if ui.small_button("✕").clicked() {
+                                        dismiss_render_clicked = true;
+                                    }
+                                });
+                            }
+                            RenderStatus::Cancelled => {
+                                ui.horizontal(|ui| {
+                                    ui.label("Export cancelled.");
+                                    if ui.small_button("✕").clicked() {
+                                        dismiss_render_clicked = true;
+                                    }
+                                });
+                            }
                         }
 
                         ui.add_space(8.0);
@@ -835,11 +1103,40 @@ impl eframe::App for App {
         if metronome_action == MetronomeAction::DetectBpm {
             self.spawn_bpm_detect();
         }
+        if cancel_render_clicked {
+            self.cancel_render();
+        }
+        if dismiss_render_clicked {
+            self.render_status = RenderStatus::Idle;
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         // Final autosave on clean shutdown so unsaved state between
         // `AUTOSAVE_INTERVAL` ticks isn't lost.
         self.autosave_flush();
+
+        // Signal any in-flight render to cancel, then briefly wait so the
+        // worker can drop its writer and remove the `.part` file. 250 ms is
+        // long enough for a chunk-boundary check (worst case ~46 ms at
+        // 44.1 kHz / chunk = 2048) plus the rm syscall, short enough not to
+        // feel like the app is hanging on quit. If the worker is mid-IO and
+        // misses the window, the OS kills the thread on process exit — the
+        // `.part` file is left behind (visibly incomplete) but no
+        // half-valid `.wav` ever lands at the target path.
+        if let Some(flag) = self.render_cancel.take() {
+            flag.store(true, Ordering::Relaxed);
+        }
+        if let Some(join) = self.render_join.take() {
+            let deadline = Instant::now() + Duration::from_millis(250);
+            while !join.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            // join.join() would block if the worker is still running; we
+            // accept the OS terminating the thread in that case.
+            if join.is_finished() {
+                let _ = join.join();
+            }
+        }
     }
 }

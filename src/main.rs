@@ -3,6 +3,7 @@ mod app;
 mod audio;
 mod dsp;
 mod engine;
+mod render;
 mod session;
 mod track;
 mod ui;

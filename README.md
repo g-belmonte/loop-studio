@@ -13,7 +13,7 @@ A practice-focused music player for musicians who learn by ear. Open a track, ma
 
 ## Status
 
-v0.1 (MVP) shipped, v0.2 closed: every checkbox in both lists is implemented. Next work moves to v0.3 (practice features).
+v0.1 (MVP), v0.2, and v0.3 are closed: every checkbox is implemented. Next work moves to v0.4.
 
 ## Tech stack
 
@@ -63,7 +63,7 @@ See [ARCHITECTURE.md](./ARCHITECTURE.md#decisions) for the design notes behind e
 - [x] **Master volume** slider (dB, -60 → +6, applied post-metronome with a per-chunk linear ramp; not persisted in sessions).
 - [x] **BPM detection** — on-demand button in the metronome row that estimates the tempo of the loop region (or whole track) via spectral-flux onset + autocorrelation. Runs on a worker thread; result lands behind a "Use" button that copies the value into the metronome.
 - [x] **Multiple saved loops** — up to 9 named slots per track, switched instantly via `Shift+1..9` (markers keep the bare number row). Side list with Save / activate / rename / delete; defining a new region (drag or `[`/`]`) detaches from the active slot and leaves it unchanged.
-- [ ] Export looped section as audio.
+- [x] **Export looped section as audio** — offline render through a fresh DSP matching the live engine (pitch, speed, EQ baked in; optional metronome; master volume excluded). Writes WAV (16-bit PCM or 32-bit float) to `<path>.part` and atomically renames on success, so a process kill mid-render never leaves a half-valid `.wav`. Cancel button + on-exit cancel flag clean up the temp file.
 
 ### Later
 

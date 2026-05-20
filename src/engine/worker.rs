@@ -8,13 +8,11 @@ use ringbuf::traits::{Observer, Producer};
 use crate::audio::output::{self, ActiveOutput};
 use crate::dsp::eq::Eq;
 use crate::dsp::passthrough::Passthrough;
-use crate::dsp::phase_vocoder::{PhaseVocoderPitchShift, PhaseVocoderSpeed};
-use crate::dsp::wsola::{WsolaPitchShift, WsolaSpeed};
 use crate::dsp::{DspKind, TimePitchProcessor};
-use crate::engine::Command;
 use crate::engine::metronome::Metronome;
 use crate::engine::speed_ramp::{SpeedRampSettings, step_in_speed_units};
 use crate::engine::state::SharedState;
+use crate::engine::{Command, make_dsp};
 use crate::track::{LoopRegion, Track};
 
 /// How often the worker wakes to refill the ring when nothing else triggers it.
@@ -537,58 +535,6 @@ fn advance_speed_ramp(
     };
     dsp.set_speed(next);
     state.speed_bits.store(next.to_bits(), Ordering::Relaxed);
-}
-
-/// Build the DSP for a track. The selected `DspKind` picks the family;
-/// within each family, we try the full pitch-shift composite first
-/// (`*PitchShift`), fall back to the speed-only adapter (`*Speed`) if
-/// rubato can't be constructed for this channel count (speed slider still
-/// works, pitch slider becomes a no-op), and ultimately fall back to
-/// `Passthrough` for degenerate channel counts.
-fn make_dsp(
-    channels: usize,
-    kind: DspKind,
-    current_speed: f32,
-    current_pitch: f32,
-) -> Box<dyn TimePitchProcessor> {
-    if channels == 0 {
-        log::error!("track has 0 channels; using passthrough");
-        return Box::new(Passthrough::new());
-    }
-    match kind {
-        DspKind::Wsola => match WsolaPitchShift::new(channels) {
-            Ok(mut p) => {
-                p.set_speed(current_speed);
-                p.set_pitch_semitones(current_pitch);
-                Box::new(p)
-            }
-            Err(e) => {
-                log::error!(
-                    "WsolaPitchShift failed for {channels} ch: {e:#}; \
-                     falling back to WsolaSpeed (no pitch shift)"
-                );
-                let mut w = WsolaSpeed::new(channels);
-                w.set_speed(current_speed);
-                Box::new(w)
-            }
-        },
-        DspKind::PhaseVocoder => match PhaseVocoderPitchShift::new(channels) {
-            Ok(mut p) => {
-                p.set_speed(current_speed);
-                p.set_pitch_semitones(current_pitch);
-                Box::new(p)
-            }
-            Err(e) => {
-                log::error!(
-                    "PhaseVocoderPitchShift failed for {channels} ch: {e:#}; \
-                     falling back to PhaseVocoderSpeed (no pitch shift)"
-                );
-                let mut w = PhaseVocoderSpeed::new(channels);
-                w.set_speed(current_speed);
-                Box::new(w)
-            }
-        },
-    }
 }
 
 /// Apply the master output gain in place. When current and target match (the
