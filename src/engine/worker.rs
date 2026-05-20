@@ -13,6 +13,7 @@ use crate::dsp::wsola::{WsolaPitchShift, WsolaSpeed};
 use crate::dsp::{DspKind, TimePitchProcessor};
 use crate::engine::Command;
 use crate::engine::metronome::Metronome;
+use crate::engine::speed_ramp::{SpeedRampSettings, step_in_speed_units};
 use crate::engine::state::SharedState;
 use crate::track::{LoopRegion, Track};
 
@@ -41,6 +42,11 @@ pub fn run(rx: Receiver<Command>, state: Arc<SharedState>) {
     // current → target linearly across one chunk to avoid zipper noise.
     let mut master_current_gain: f32 = 1.0;
     let mut master_target_gain: f32 = 1.0;
+    // Speed-ramp state. Settings carry across loads (UI source of truth);
+    // `passes_since_step` is the local counter the worker keeps to know when
+    // to fire a step. Reset on a rising edge of `enabled` and on Stop.
+    let mut speed_ramp = SpeedRampSettings::default();
+    let mut passes_since_step: u32 = 0;
     let mut scratch: Vec<f32> = Vec::new();
     // Stitching buffer for chunks that straddle a loop boundary. Lazily sized
     // on first wrap; cost is one allocation per playback session.
@@ -60,6 +66,8 @@ pub fn run(rx: Receiver<Command>, state: Arc<SharedState>) {
             &mut metronome,
             &mut eq,
             &mut master_target_gain,
+            &mut speed_ramp,
+            &mut passes_since_step,
             &mut scratch,
             &state,
         );
@@ -80,6 +88,8 @@ pub fn run(rx: Receiver<Command>, state: Arc<SharedState>) {
                 &mut eq,
                 &mut master_current_gain,
                 master_target_gain,
+                &speed_ramp,
+                &mut passes_since_step,
                 &mut scratch,
                 &mut stitch_buf,
                 &state,
@@ -109,6 +119,8 @@ fn drain_commands(
     metronome: &mut Metronome,
     eq: &mut Eq,
     master_target_gain: &mut f32,
+    speed_ramp: &mut SpeedRampSettings,
+    passes_since_step: &mut u32,
     scratch: &mut Vec<f32>,
     state: &SharedState,
 ) -> bool {
@@ -127,6 +139,8 @@ fn drain_commands(
                 metronome,
                 eq,
                 master_target_gain,
+                speed_ramp,
+                passes_since_step,
                 scratch,
                 state,
             ),
@@ -150,6 +164,8 @@ fn apply(
     metronome: &mut Metronome,
     eq: &mut Eq,
     master_target_gain: &mut f32,
+    speed_ramp: &mut SpeedRampSettings,
+    passes_since_step: &mut u32,
     scratch: &mut Vec<f32>,
     state: &SharedState,
 ) {
@@ -286,6 +302,16 @@ fn apply(
         Command::SetEq(settings) => {
             eq.set_settings(settings);
         }
+        Command::SetSpeedRamp(new) => {
+            // Rising edge on `enabled` resets the per-step counter so the
+            // first bump lands `passes_per_step` wraps after the user turns it
+            // on — not immediately, which would feel jarring. Falling edge
+            // also resets so re-enabling later starts a fresh cycle.
+            if new.enabled != speed_ramp.enabled {
+                *passes_since_step = 0;
+            }
+            *speed_ramp = new;
+        }
         Command::SetMasterVolume(db) => {
             // Clamp + convert to linear here so produce() never has to think
             // about dB. Floor at -60 dB (~0.001×) since the slider stops there;
@@ -315,6 +341,8 @@ fn produce(
     eq: &mut Eq,
     master_current_gain: &mut f32,
     master_target_gain: f32,
+    speed_ramp: &SpeedRampSettings,
+    passes_since_step: &mut u32,
     scratch: &mut Vec<f32>,
     stitch_buf: &mut Vec<f32>,
     state: &SharedState,
@@ -352,6 +380,11 @@ fn produce(
 
     let in_samples = in_chunk * channels;
     let cursor_before = *cursor;
+    // Set inside the stitch arm below; consumed after push_slice to drive the
+    // speed-ramp step counter. The wrap happens *at the end* of this chunk
+    // (cursor crosses loop.end into loop.start), so we bump the counter then,
+    // not on the first chunk that lands inside the loop.
+    let mut wrapped = false;
 
     // Decide where the chunk's input comes from. Three cases:
     //   1) Plain slice: enough source before the loop end (or end of track).
@@ -384,6 +417,7 @@ fn produce(
                 // Not supported in v0.1; produce silence and bail.
                 return;
             }
+            wrapped = true;
             if stitch_buf.len() < in_samples {
                 stitch_buf.resize(in_samples, 0.0);
             }
@@ -453,6 +487,56 @@ fn produce(
 
     *cursor = new_cursor;
     state.position.store(*cursor, Ordering::Relaxed);
+
+    if wrapped {
+        advance_speed_ramp(speed_ramp, passes_since_step, dsp, metronome, state);
+    }
+}
+
+/// Called once per loop wrap. If a ramp is configured and we've reached the
+/// next step, nudge the speed toward target by one step (clamped) and update
+/// `state.speed_bits` so the UI slider follows. Ramps in BPM units are
+/// translated via the metronome's current BPM; if the user hasn't dialed a
+/// meaningful BPM, the step resolves to zero and we no-op.
+fn advance_speed_ramp(
+    speed_ramp: &SpeedRampSettings,
+    passes_since_step: &mut u32,
+    dsp: &mut dyn TimePitchProcessor,
+    metronome: &Metronome,
+    state: &SharedState,
+) {
+    if !speed_ramp.enabled {
+        return;
+    }
+    *passes_since_step = passes_since_step.saturating_add(1);
+    let needed = speed_ramp.passes_per_step.max(1);
+    if *passes_since_step < needed {
+        return;
+    }
+    *passes_since_step = 0;
+
+    let current = f32::from_bits(state.speed_bits.load(Ordering::Relaxed));
+    let target = speed_ramp.target_speed;
+    if !current.is_finite() || !target.is_finite() {
+        return;
+    }
+    let diff = target - current;
+    if diff.abs() < 1e-6 {
+        return;
+    }
+    let delta = step_in_speed_units(speed_ramp, metronome.bpm());
+    if delta <= 0.0 {
+        return;
+    }
+    let signed = if diff > 0.0 { delta } else { -delta };
+    // Clamp at target so we don't overshoot on the last step.
+    let next = if signed > 0.0 {
+        (current + signed).min(target)
+    } else {
+        (current + signed).max(target)
+    };
+    dsp.set_speed(next);
+    state.speed_bits.store(next.to_bits(), Ordering::Relaxed);
 }
 
 /// Build the DSP for a track. The selected `DspKind` picks the family;

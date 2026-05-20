@@ -382,8 +382,12 @@ impl Eq {
             for ch in 0..channels {
                 let idx = f * channels + ch;
                 let mut s = buf[idx];
-                for slot in 0..active {
-                    s = self.states[ch][slot].process(s, &frame_coeffs[slot]);
+                for (state, coeffs) in self.states[ch]
+                    .iter_mut()
+                    .zip(frame_coeffs.iter())
+                    .take(active)
+                {
+                    s = state.process(s, coeffs);
                 }
                 buf[idx] = s;
             }

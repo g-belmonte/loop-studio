@@ -3,9 +3,14 @@ use std::sync::atomic::Ordering;
 use crate::dsp::DspKind;
 use crate::engine::{Command, Engine};
 
-/// Render play/pause/stop + a seek slider. Returns true if the user is
-/// actively dragging the seek slider, so the caller can decide whether to
-/// keep repainting at high frequency.
+/// Outcome of one transport-row render. `speed_user_changed` lets the caller
+/// auto-disable an active speed ramp on manual override.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TransportResult {
+    pub speed_user_changed: bool,
+}
+
+/// Render play/pause/stop + a seek slider.
 ///
 /// `dsp_kind` is the App's chosen stretch engine (UI source of truth, like
 /// the loop region). The selector edits it in place and sends `SetDsp` on
@@ -16,6 +21,7 @@ use crate::engine::{Command, Engine};
 /// `Command::SetPitch`. Keeping the split here means the two sliders are
 /// independent: dragging cents to ±50 won't bump the semitone, and the "0 st"
 /// reset doesn't wipe the user's cents offset (and vice versa).
+#[allow(clippy::too_many_arguments)]
 pub fn show(
     ui: &mut egui::Ui,
     engine: &Engine,
@@ -25,7 +31,7 @@ pub fn show(
     master_volume_db: &mut f32,
     sample_rate: u32,
     total_frames: u64,
-) -> bool {
+) -> TransportResult {
     let state = engine.state();
     let playing = state.playing.load(Ordering::Relaxed);
     let position = state.position.load(Ordering::Relaxed).min(total_frames);
@@ -55,7 +61,6 @@ pub fn show(
             .show_value(false)
             .text("seek"),
     );
-    let dragging = response.dragged();
     if response.changed() {
         engine.send(Command::Seek(pos));
     }
@@ -84,6 +89,11 @@ pub fn show(
     if !speed.is_finite() || speed <= 0.0 {
         speed = 1.0;
     }
+    // Track user-initiated speed edits so the caller can auto-disable the
+    // speed ramp. `Slider::changed()` only fires on user input (changing the
+    // bound variable between frames doesn't count), so it cleanly excludes the
+    // engine's own ramp-driven speed bumps.
+    let mut speed_user_changed = false;
     ui.horizontal(|ui| {
         let r = ui.add(
             egui::Slider::new(&mut speed, 0.25..=2.0)
@@ -92,9 +102,11 @@ pub fn show(
         );
         if r.changed() {
             engine.send(Command::SetSpeed(speed));
+            speed_user_changed = true;
         }
         if ui.button("1×").clicked() {
             engine.send(Command::SetSpeed(1.0));
+            speed_user_changed = true;
         }
     });
 
@@ -148,7 +160,7 @@ pub fn show(
         }
     });
 
-    dragging
+    TransportResult { speed_user_changed }
 }
 
 pub fn format_time(frames: u64, sample_rate: u32) -> String {

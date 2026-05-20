@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crate::dsp::DspKind;
 use crate::dsp::eq::EqSettings;
 use crate::engine::metronome::MetronomeSettings;
+use crate::engine::speed_ramp::SpeedRampSettings;
 use crate::track::{LoopRegion, Track};
 
 #[derive(Debug, Clone)]
@@ -38,4 +39,8 @@ pub enum Command {
     /// into per-field commands. Applied between DSP and metronome on the
     /// worker; coefficient smoothing across the chunk is handled inside `Eq`.
     SetEq(EqSettings),
+    /// Replace the speed-ramp state in one shot. The worker counts loop wraps
+    /// against `passes_per_step` and bumps speed toward `target_speed` on each
+    /// step. A rising edge on `enabled` resets the per-step counter.
+    SetSpeedRamp(SpeedRampSettings),
 }

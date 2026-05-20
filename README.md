@@ -57,7 +57,7 @@ See [ARCHITECTURE.md](./ARCHITECTURE.md#decisions) for the design notes behind e
 
 ### v0.3 — Practice features
 
-- [ ] **Speed ramping**: gradually increase loop speed each pass.
+- [x] **Speed ramping**: gradually increase loop speed each pass.
 - [x] **EQ / band isolation** — 5-band biquad cascade (low-shelf @ 200 Hz, peak @ 500 / 1k / 2.5k Hz, high-shelf @ 4 kHz) with per-band gain and "Solo" buttons that swap the cascade for an isolation filter (LPF / BPF / HPF) tuned to that band. Sits between DSP and metronome on the engine worker.
 - [x] **Click track / metronome** synced to a tap-set tempo (source-frame anchored at the loop start, optional accent + beats/measure, BPM via tap / `T` key / number entry, mixed post-DSP into the engine output).
 - [x] **Master volume** slider (dB, -60 → +6, applied post-metronome with a per-chunk linear ramp; not persisted in sessions).

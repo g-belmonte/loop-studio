@@ -1,5 +1,6 @@
 pub mod command;
 pub mod metronome;
+pub mod speed_ramp;
 pub mod state;
 pub mod worker;
 

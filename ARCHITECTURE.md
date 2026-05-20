@@ -271,11 +271,11 @@ Cost: one extra pass through `NUM_BINS` per channel for transient detection, two
 
 ## Session format
 
-Versioned from day one so we can migrate without breaking saved sessions. Each release bumps the version when fields change: v2 added `dsp_kind`, v3 added `markers`, v4 added `metronome`, v5 adds `eq`. While the project is in alpha (pre-v0.1 release), `Session::load` only accepts `version == CURRENT_VERSION` — older sessions are rejected outright rather than carrying forward `#[serde(default)]` shims. Backward-compat migrations land when we ship a release. The current schema:
+Versioned from day one so we can migrate without breaking saved sessions. Each release bumps the version when fields change: v2 added `dsp_kind`, v3 added `markers`, v4 added `metronome`, v5 added `eq`, v6 adds `speed_ramp`. While the project is in alpha (pre-v0.1 release), `Session::load` only accepts `version == CURRENT_VERSION` — older sessions are rejected outright rather than carrying forward `#[serde(default)]` shims. Backward-compat migrations land when we ship a release. The current schema:
 
 ```json
 {
-  "version": 5,
+  "version": 6,
   "track_path": "/home/me/music/song.flac",
   "track_sample_rate": 44100,
   "loop_region": { "start": 1234567, "end": 2345678 },
@@ -303,6 +303,13 @@ Versioned from day one so we can migrate without breaking saved sessions. Each r
       { "gain_db": 0.0, "solo": false },
       { "gain_db": 0.0, "solo": false }
     ]
+  },
+  "speed_ramp": {
+    "enabled": false,
+    "target_speed": 1.0,
+    "step_unit": "percent",
+    "step_amount": 5.0,
+    "passes_per_step": 2
   }
 }
 ```
@@ -392,6 +399,17 @@ Versioned from day one so we can migrate without breaking saved sessions. Each r
   UI lives in `ui::metronome::show` next to the Tap button: a "Detect" button (disabled while `Running`), an inline status (`spinner` / `"124 BPM" + Use button` / `"no tempo found"`), and a `Use` button that copies the detected value into `settings.bpm` (same path as Tap; triggers the existing `Command::SetMetronome` on dirty). `show` returns `MetronomeAction::DetectBpm` when the Detect button is clicked; `App::update` acts on it *after* the central-panel closure returns so the `&mut self` borrow inside the closure doesn't conflict with `spawn_bpm_detect`.
   
   Considered and rejected: auto-running detection on every `LoadTrack` (most users won't need it for any given track, and ~40 MB of ephemeral working memory plus ~half a second of CPU on every open is too much for a feature you opt into); persisting the detected BPM in the session schema (would need a v6 bump for a cache of something cheap to recompute); a beat-time array / tempogram for sub-track BPM curves (a v0.4 concern if it ever comes up — for a practice tool, "what tempo is this passage" is enough); using `aubio` via FFI (drags in a C build dep for the same accuracy on the kind of clean rock/pop/electronic this tool targets).
+- **Speed ramping** (decided v0.3). `engine::speed_ramp::SpeedRampSettings { enabled, target_speed, step_unit, step_amount, passes_per_step }` lives in `App` (UI source of truth, like `metronome` and `eq`) and is pushed to the worker via `Command::SetSpeedRamp` on every change. The worker holds its own `passes_since_step: u32` counter — never exposed to the UI; reset on a rising *or* falling edge of `enabled` so re-enabling later starts a fresh cycle.
+
+  **Detection point is the loop-stitch branch in `produce()`** — the one path that ever wraps `cursor` from inside the loop back to `loop.start`. `advance_speed_ramp` runs *after* `push_slice` for that chunk: increment `passes_since_step`, and if it reaches `passes_per_step`, compute one step and apply via `dsp.set_speed()` + `state.speed_bits.store()`. The UI slider re-binds from `speed_bits` every frame, so it visibly follows the engine's ramp without any extra plumbing. Tied to wraps (not wall-clock seconds, not chunk count) because "every N passes through the loop" is the practice-tool unit the user reasons in.
+
+  **Step unit is either percent or BPM**. Percent is a fixed delta on the speed multiplier (5% → +0.05 per step). BPM uses the metronome's current `bpm` as the source tempo: `delta = step_bpm / metronome.bpm`, so "+5 BPM" at a 120 BPM source bumps speed by ~0.0417 per step. Resolved in `speed_ramp::step_in_speed_units`; returns 0 (no-op) for a non-finite or zero source BPM. Using the metronome's BPM regardless of whether the metronome itself is *enabled* — the BPM field stays meaningful (BPM detect populates it, tap-tempo populates it) even when the click is muted, and "I dialed in the source tempo but don't want a click" is a normal flow.
+
+  **Step direction follows `target_speed - speed`**, with a clamp at the target so the final step never overshoots. Once `speed == target`, the per-step counter still ticks but the step is a no-op; the user can lift `target_speed` higher mid-session and ramping resumes. No auto-disable on reach.
+
+  **Manual override disables the ramp from the UI side**: dragging the speed slider or pressing "1×" sends both `SetSpeed` *and* `SetSpeedRamp { enabled: false, .. }`. The engine doesn't auto-disable on `SetSpeed` — session restore legitimately sends `SetSpeed` together with `SetSpeedRamp { enabled: true }` and we'd otherwise clobber the restored intent. `Slider::changed()` only fires on user input (the engine ramping the bound value between frames doesn't count as a user change in egui), so we cleanly distinguish "user dragged" from "engine bumped".
+
+  Persisted in session schema v6 (`speed_ramp: SpeedRampSettings`). `SetSpeedRamp` lands between `SetMetronome` and `SetLoop` on restore so the engine's first wrap on this track is counted against the restored ramp config, not a default. Considered and rejected: linear interpolation over N total passes (count-based) — fixed step is what a player actually thinks in ("add 5%"); per-loop persistent count surviving across sessions (the wrap counter is engine-local and there's no need to survive a reopen); auto-disable when target is reached (no — let the user widen the target and resume); driving the ramp from wall-clock seconds (decouples from the practice unit and skews when speed itself changes the loop duration).
 - **Master output volume** (decided v0.3). `App::master_volume_db: f32` (UI source of truth, default 0 dB) drives a slider in `ui::transport`; on change the UI sends `Command::SetMasterVolume(db)`. The worker holds `master_current_gain` / `master_target_gain` (linear); `apply_master_gain` runs after the metronome mix and before `producer.push_slice`, linearly ramping current → target across the chunk so fast slider drags don't zipper. At steady state we skip multiplication entirely when target is unity (the common case) and apply a constant scalar otherwise. Range -60..=+6 dB; -60 is the floor (~0.001×), +6 is headroom that can clip on already-hot material. Applied **post**-metronome so the slider behaves like a true output fader and the metronome's own `volume_db` stays a relative trim. **Not persisted** in sessions — resets to 0 dB on every app launch (a per-track loudness offset is a separate problem; lumping it into the per-track autosession would tie the master slider to whichever track loaded last, which is the wrong mental model for "output fader"). Considered and rejected: applying pre-metronome (decouples the master from the click); a linear-percent or 0..2× scale (dB matches musician intuition and the existing metronome slider); per-track persistence (see above); a soft-knee limiter on the +6 dB top end (skip until clipping is shown to bite real material).
 - **Lenient session loading at the boundary** (decided v0.1 step 7). Saved sessions are validated only where the data could actually be wrong: the loop region is clamped to `[0, track_frame_count)` and dropped if degenerate (`start ≥ end` after clamping); `last_position` is clamped to track length; speed and pitch are passed through to the engine, which clamps them itself. The `version` field is checked strictly — any value other than `Session::CURRENT_VERSION = 1` errors out. A missing track file surfaces through the existing decode-failure path (`LoadStatus::Failed`) and clears the pending restore. JSON parse errors and write failures bubble up to a `session_error` line in the UI.
 

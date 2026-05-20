@@ -12,6 +12,7 @@ use crate::audio::decoder;
 use crate::dsp::DspKind;
 use crate::dsp::eq::EqSettings;
 use crate::engine::metronome::MetronomeSettings;
+use crate::engine::speed_ramp::SpeedRampSettings;
 use crate::engine::{Command, Engine};
 use crate::session::{Session, auto as autosession};
 use crate::track::peaks::TrackPeaks;
@@ -20,8 +21,8 @@ use crate::ui::metronome::{MetronomeAction, TapTempo};
 use crate::ui::shortcuts::LoopEndpoint;
 use crate::ui::waveform::{WaveformAction, WaveformView};
 use crate::ui::{
-    eq as eq_ui, markers as marker_list, menu, metronome as metronome_ui, shortcuts, transport,
-    waveform,
+    eq as eq_ui, markers as marker_list, menu, metronome as metronome_ui, shortcuts,
+    speed_ramp as speed_ramp_ui, transport, waveform,
 };
 
 /// Debounce interval for per-track auto-save. A loaded track is checked once
@@ -69,6 +70,7 @@ struct PendingRestore {
     markers: Vec<Marker>,
     metronome: MetronomeSettings,
     eq: EqSettings,
+    speed_ramp: SpeedRampSettings,
 }
 
 pub struct App {
@@ -106,6 +108,10 @@ pub struct App {
     /// EQ settings (UI source of truth — engine gets a copy via
     /// `Command::SetEq` on every change). Persisted in sessions (v5+).
     eq: EqSettings,
+    /// Speed-ramp settings (UI source of truth — engine gets a copy via
+    /// `Command::SetSpeedRamp`). Persisted in sessions (v6+). The engine
+    /// owns the per-step counter; the UI never reads it back.
+    speed_ramp: SpeedRampSettings,
     /// Tap-tempo accumulator. Purely GUI; doesn't survive across runs.
     tap_tempo: TapTempo,
     /// Visible window into the waveform. Reset to full-track on every load
@@ -155,6 +161,7 @@ impl App {
             master_volume_db: 0.0,
             metronome: MetronomeSettings::default(),
             eq: EqSettings::default(),
+            speed_ramp: SpeedRampSettings::default(),
             tap_tempo: TapTempo::new(),
             view: WaveformView::full(0),
             follow_playhead: true,
@@ -187,6 +194,7 @@ impl App {
                 markers: session.markers,
                 metronome: session.metronome,
                 eq: session.eq,
+                speed_ramp: session.speed_ramp,
             });
         }
         self.spawn_decode(path, ctx.clone());
@@ -300,6 +308,7 @@ impl App {
                         self.markers = clamp_markers(pending.markers, total);
                         self.metronome = pending.metronome;
                         self.eq = pending.eq;
+                        self.speed_ramp = pending.speed_ramp;
                         (self.pitch_coarse, self.pitch_cents) =
                             split_pitch(pending.pitch_semitones);
                         if let Some(engine) = &self.engine {
@@ -309,10 +318,14 @@ impl App {
                             // metronome settings are in place when SetLoop
                             // updates the anchor (and not before LoadTrack,
                             // which resets the anchor on its own).
+                            // SetSpeedRamp lands before SetLoop too so the
+                            // engine's first wrap on this track is counted
+                            // against the restored ramp config.
                             engine.send(Command::SetDsp(pending.dsp_kind));
                             engine.send(Command::SetSpeed(pending.speed));
                             engine.send(Command::SetPitch(pending.pitch_semitones));
                             engine.send(Command::SetMetronome(pending.metronome));
+                            engine.send(Command::SetSpeedRamp(pending.speed_ramp));
                             engine.send(Command::SetLoop(new_loop));
                             engine.send(Command::Seek(last_pos));
                         }
@@ -375,6 +388,7 @@ impl App {
             markers: self.markers.clone(),
             metronome: self.metronome,
             eq: self.eq,
+            speed_ramp: self.speed_ramp,
         };
         Some((track_path.clone(), session))
     }
@@ -471,6 +485,7 @@ impl App {
             markers: session.markers,
             metronome: session.metronome,
             eq: session.eq,
+            speed_ramp: session.speed_ramp,
         });
         self.spawn_decode(session.track_path, ctx.clone());
     }
@@ -674,7 +689,7 @@ impl eframe::App for App {
                         }
 
                         ui.add_space(8.0);
-                        transport::show(
+                        let transport_result = transport::show(
                             ui,
                             engine,
                             &mut self.dsp_kind,
@@ -684,6 +699,16 @@ impl eframe::App for App {
                             track.sample_rate,
                             track.frame_count(),
                         );
+                        // Manual speed override disables an in-progress ramp:
+                        // the user's intent wins. Push the disabled state to
+                        // the engine so it stops counting wraps too.
+                        if transport_result.speed_user_changed && self.speed_ramp.enabled {
+                            self.speed_ramp.enabled = false;
+                            engine.send(Command::SetSpeedRamp(self.speed_ramp));
+                        }
+
+                        ui.add_space(8.0);
+                        speed_ramp_ui::show(ui, &mut self.speed_ramp, engine);
 
                         ui.add_space(8.0);
                         ui.separator();

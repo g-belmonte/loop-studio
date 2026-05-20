@@ -85,6 +85,13 @@ impl Metronome {
         self.voice = None;
     }
 
+    /// Current source BPM (the user-dialed tempo of the underlying track).
+    /// Read by the speed-ramp logic to translate a BPM-unit step into a delta
+    /// on the speed multiplier.
+    pub fn bpm(&self) -> f32 {
+        self.settings.bpm
+    }
+
     pub fn set_settings(&mut self, new: MetronomeSettings) {
         let was_enabled = self.settings.enabled;
         self.settings = new;
