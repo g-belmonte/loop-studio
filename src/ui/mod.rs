@@ -1,3 +1,4 @@
+pub mod eq;
 pub mod markers;
 pub mod menu;
 pub mod metronome;

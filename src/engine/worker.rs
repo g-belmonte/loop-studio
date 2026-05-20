@@ -6,6 +6,7 @@ use crossbeam_channel::{Receiver, TryRecvError};
 use ringbuf::traits::{Observer, Producer};
 
 use crate::audio::output::{self, ActiveOutput};
+use crate::dsp::eq::Eq;
 use crate::dsp::passthrough::Passthrough;
 use crate::dsp::phase_vocoder::{PhaseVocoderPitchShift, PhaseVocoderSpeed};
 use crate::dsp::wsola::{WsolaPitchShift, WsolaSpeed};
@@ -30,6 +31,11 @@ pub fn run(rx: Receiver<Command>, state: Arc<SharedState>) {
     let mut current_channels: Option<u16> = None;
     let mut current_kind: DspKind = DspKind::default();
     let mut metronome = Metronome::new();
+    // EQ runs between dsp.process() and metronome.mix_segment(). Recreated
+    // alongside the DSP when channel count or sample rate changes (per-channel
+    // biquad state, and coefficient formulae depend on sr). Until then it
+    // holds a default bypass instance so process_in_place is a no-op.
+    let mut eq = Eq::new(0, 0);
     // Master output gain (linear). `current` tracks what the last chunk ended
     // at; `target` is what the UI most recently requested. produce() ramps
     // current → target linearly across one chunk to avoid zipper noise.
@@ -52,6 +58,7 @@ pub fn run(rx: Receiver<Command>, state: Arc<SharedState>) {
             &mut current_channels,
             &mut current_kind,
             &mut metronome,
+            &mut eq,
             &mut master_target_gain,
             &mut scratch,
             &state,
@@ -70,6 +77,7 @@ pub fn run(rx: Receiver<Command>, state: Arc<SharedState>) {
                 out,
                 &mut *dsp,
                 &mut metronome,
+                &mut eq,
                 &mut master_current_gain,
                 master_target_gain,
                 &mut scratch,
@@ -99,6 +107,7 @@ fn drain_commands(
     current_channels: &mut Option<u16>,
     current_kind: &mut DspKind,
     metronome: &mut Metronome,
+    eq: &mut Eq,
     master_target_gain: &mut f32,
     scratch: &mut Vec<f32>,
     state: &SharedState,
@@ -116,6 +125,7 @@ fn drain_commands(
                 current_channels,
                 current_kind,
                 metronome,
+                eq,
                 master_target_gain,
                 scratch,
                 state,
@@ -138,6 +148,7 @@ fn apply(
     current_channels: &mut Option<u16>,
     current_kind: &mut DspKind,
     metronome: &mut Metronome,
+    eq: &mut Eq,
     master_target_gain: &mut f32,
     scratch: &mut Vec<f32>,
     state: &SharedState,
@@ -183,6 +194,13 @@ fn apply(
             // Loop is cleared on load — anchor reverts to track start.
             metronome.set_anchor(0);
             metronome.reset_voice();
+
+            // EQ holds per-channel biquad state and computes coefficients from
+            // the sample rate; recreate it on every LoadTrack rather than
+            // gating on channel-count change so a same-channel-count reload at
+            // a different sample rate (e.g. 44.1 → 48 kHz) doesn't keep stale
+            // coefficients. Settings are re-pushed by the App via SetEq.
+            *eq = Eq::new(new_track.channels as usize, new_track.sample_rate);
 
             *cursor = 0;
             *playing = false;
@@ -265,6 +283,9 @@ fn apply(
         Command::SetMetronome(settings) => {
             metronome.set_settings(settings);
         }
+        Command::SetEq(settings) => {
+            eq.set_settings(settings);
+        }
         Command::SetMasterVolume(db) => {
             // Clamp + convert to linear here so produce() never has to think
             // about dB. Floor at -60 dB (~0.001×) since the slider stops there;
@@ -291,6 +312,7 @@ fn produce(
     output: &mut ActiveOutput,
     dsp: &mut dyn TimePitchProcessor,
     metronome: &mut Metronome,
+    eq: &mut Eq,
     master_current_gain: &mut f32,
     master_target_gain: f32,
     scratch: &mut Vec<f32>,
@@ -394,6 +416,11 @@ fn produce(
 
     let out_samples = out_written * channels;
     let out_slice = &mut scratch[..out_samples];
+
+    // EQ runs over the DSP output before the metronome mixes in. Placing it
+    // pre-metronome keeps the click pristine even when a "solo" band has
+    // filtered the music down to a sliver — the metronome stays audible.
+    eq.process_in_place(out_slice);
 
     // Mix metronome into the just-produced output. For stitched chunks we
     // split the output proportionally to the source-frame split so each beat

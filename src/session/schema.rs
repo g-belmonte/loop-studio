@@ -4,6 +4,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::dsp::DspKind;
+use crate::dsp::eq::EqSettings;
 use crate::engine::metronome::MetronomeSettings;
 use crate::track::{LoopRegion, Marker};
 
@@ -19,10 +20,11 @@ pub struct Session {
     pub dsp_kind: DspKind,
     pub markers: Vec<Marker>,
     pub metronome: MetronomeSettings,
+    pub eq: EqSettings,
 }
 
 impl Session {
-    pub const CURRENT_VERSION: u32 = 4;
+    pub const CURRENT_VERSION: u32 = 5;
 
     pub fn save(&self, path: &Path) -> Result<()> {
         let json = serde_json::to_string_pretty(self).context("serialising session")?;

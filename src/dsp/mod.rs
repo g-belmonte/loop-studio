@@ -1,3 +1,4 @@
+pub mod eq;
 pub mod passthrough;
 pub mod phase_vocoder;
 pub mod wsola;

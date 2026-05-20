@@ -79,7 +79,9 @@ src/
 ├── dsp/
 │   ├── mod.rs           # trait TimePitchProcessor
 │   ├── passthrough.rs   # baseline: no stretch, no shift (fallback)
-│   └── wsola.rs         # MVP impl: WSOLA time-stretch + rubato cascade for pitch
+│   ├── wsola.rs         # MVP impl: WSOLA time-stretch + rubato cascade for pitch
+│   ├── phase_vocoder.rs # FFT-based time-stretch + rubato cascade (selectable DSP family)
+│   └── eq.rs            # 5-band biquad EQ with per-band solo isolation
 │
 ├── track/
 │   ├── mod.rs           # Track: decoded samples, sample rate, channels
@@ -97,6 +99,7 @@ src/
     ├── shortcuts.rs     # global keyboard handler (space/arrows/[/]/Esc/Home/End/M/T/1-9/+/-)
     ├── markers.rs       # marker side list (seek button + label edit + delete)
     ├── metronome.rs     # metronome row (toggle/BPM/Tap/accent/beats/volume) + tap-tempo accumulator
+    ├── eq.rs            # EQ panel (enable + 5 band columns: gain slider + solo button)
     └── menu.rs          # file menu, open/save session
 ```
 
@@ -116,6 +119,7 @@ pub enum Command {
     SetDsp(DspKind),           // switch stretch engine; rebuilds DSP
     SetMetronome(MetronomeSettings), // enabled / BPM / accent / beats / volume
     SetMasterVolume(f32),      // dB, applied post-metronome with per-chunk ramp
+    SetEq(EqSettings),         // 5-band gain + per-band solo
 }
 
 // track/mod.rs
@@ -264,11 +268,11 @@ Cost: one extra pass through `NUM_BINS` per channel for transient detection, two
 
 ## Session format
 
-Versioned from day one so we can migrate without breaking saved sessions. The original v1 shape carried only loop region + speed + pitch + last position; v2 added `dsp_kind` (see step 8a); v3 added `markers`; v4 adds `metronome`. While the project is in alpha (pre-v0.1 release), `Session::load` only accepts `version == CURRENT_VERSION` — older sessions are rejected outright rather than carrying forward `#[serde(default)]` shims. Backward-compat migrations land when we ship a release. The current schema:
+Versioned from day one so we can migrate without breaking saved sessions. Each release bumps the version when fields change: v2 added `dsp_kind`, v3 added `markers`, v4 added `metronome`, v5 adds `eq`. While the project is in alpha (pre-v0.1 release), `Session::load` only accepts `version == CURRENT_VERSION` — older sessions are rejected outright rather than carrying forward `#[serde(default)]` shims. Backward-compat migrations land when we ship a release. The current schema:
 
 ```json
 {
-  "version": 4,
+  "version": 5,
   "track_path": "/home/me/music/song.flac",
   "track_sample_rate": 44100,
   "loop_region": { "start": 1234567, "end": 2345678 },
@@ -286,6 +290,16 @@ Versioned from day one so we can migrate without breaking saved sessions. The or
     "accent": true,
     "beats_per_measure": 4,
     "volume_db": -6.0
+  },
+  "eq": {
+    "enabled": false,
+    "bands": [
+      { "gain_db": 0.0, "solo": false },
+      { "gain_db": 0.0, "solo": false },
+      { "gain_db": 0.0, "solo": false },
+      { "gain_db": 0.0, "solo": false },
+      { "gain_db": 0.0, "solo": false }
+    ]
   }
 }
 ```
@@ -348,6 +362,19 @@ Versioned from day one so we can migrate without breaking saved sessions. The or
   Persisted in session schema v4 (`metronome: MetronomeSettings`). On session restore the engine sees `SetMetronome` *after* `SetSpeed`/`SetPitch` and *before* `SetLoop` — that ordering matters because `SetLoop` is what updates the metronome's anchor, and `SetMetronome` is otherwise anchor-agnostic.
 
   Considered and rejected: a separate cpal stream for the click (a second output device and a clock-sync problem); pre-DSP mixing (click gets time-stretched and pitch-shifted with the music); layering multiple in-flight click voices (at musical tempos beats are >>40 ms apart, so the click decay always finishes before the next trigger — layering would buy nothing); modal "Set downbeat at playhead" (`B`-key) UI (the loop-start anchor already covers the common case in one fewer key, and an explicit downbeat key can land if practice with off-bar loops becomes a real workflow).
+- **EQ / band isolation** (decided v0.3). `dsp::eq::Eq` owns a per-channel array of `NUM_BANDS = 5` direct-form-I biquads driven by `EqSettings { enabled, bands: [BandSettings { gain_db, solo }; 5] }`. The five bands are fixed: low-shelf @ 200 Hz, peaks @ 500 / 1 k / 2.5 kHz (`Q = 1.0`), high-shelf @ 4 kHz; gain only, no per-band frequency control — keeps the UI tight for the "bass vs vocal" practice case while leaving the cascade trivially extendable to parametric controls later. Coefficients are RBJ cookbook formulas evaluated against the track sample rate.
+
+  **Solo mode swaps the entire chain** for a single isolation filter tuned to the soloed band: LPF for the low shelf, BPF for the three peaks (`Q = 0.7` so the soloed peak sounds like a region, not a tone burst), HPF for the high shelf. A 5-stage cascade can't truly isolate one band — the bands are additive shapings of the same signal — so trying to "mute the others" by setting their gains to ‑∞ would just notch the spectrum. The mode-swap behaves the way a user expects: solo low → low-pass; solo mid → band-pass; solo high → high-pass. UI enforces at most one solo at a time (clicking one clears the others); if the JSON ever carries multiple, the lowest-index band wins.
+
+  **Direct-form-I**, not DF-II-transposed. DF-I's state is past inputs/outputs in the same units as the signal, so when coefficients change between samples the state stays meaningful; DF-II-T's state is in a coefficient-dependent basis and bends under coefficient changes. Smoothing matters here because per-sample coefficient interpolation across each chunk is how we kill zipper noise on slider drags.
+
+  **Coefficient smoothing**: at the start of each `process_in_place()` we compute the target coefficients from the current settings; if the chain length (`active` biquad count: 0 bypass / 1 solo / 5 normal) matches the previous chunk's, we linearly interpolate `coeffs → target` across the chunk frame-by-frame. If the chain length differs (enable toggle, or normal⇄solo), interpolation across structurally different filters produces nonsense intermediate biquads, so we snap to the new state and accept a brief artefact (~one chunk, ~23 ms). Per-band gain slider drags are the common case and stay structurally fixed, so smoothing works.
+
+  **Chain placement** in `engine::worker::produce()`: `dsp.process()` → `eq.process_in_place()` → `metronome.mix_segment()` → `apply_master_gain()`. Pre-metronome so the click stays unfiltered — a "solo high" that mutes everything below 4 kHz must not also mute the metronome. Pre-master-gain so the master fader behaves like a true output trim across the whole bus.
+
+  **Per-LoadTrack reset**: the EQ is recreated (`Eq::new`) on every LoadTrack rather than gated on channel-count change. Coefficients depend on sample rate, and biquad state is per-channel — both can shift across loads — so always rebuilding is the simpler invariant. To compensate, `App` re-pushes its current `EqSettings` via `SetEq` after every LoadTrack send. Whether the load is a fresh open, a manual session load, or an autosession restore, the same re-push covers it; the restore branch just updates `self.eq` from `pending.eq` first.
+
+  Persisted in session schema v5 (`eq: EqSettings`). Considered and rejected: parametric N-band EQ (the UI gets crowded fast and "bass vs vocal" only needs five regions); Linkwitz-Riley crossover network for true parallel band split (full-fledged crossover gives clean parallel solos but adds a lot of infrastructure for a feature that does fine with single-biquad swaps); cents-grained gain smoothing across multiple chunks (per-chunk linear ramp is what we already do for master gain and it works; a longer smoother adds latency for no audible win on slider drags); pre-DSP placement (the DSP would then time-stretch and pitch-shift the filtered output, which is fine in theory but means re-shaping post-stretch frequency content — the user thinks of EQ as colouring the output, not the source).
 - **Master output volume** (decided v0.3). `App::master_volume_db: f32` (UI source of truth, default 0 dB) drives a slider in `ui::transport`; on change the UI sends `Command::SetMasterVolume(db)`. The worker holds `master_current_gain` / `master_target_gain` (linear); `apply_master_gain` runs after the metronome mix and before `producer.push_slice`, linearly ramping current → target across the chunk so fast slider drags don't zipper. At steady state we skip multiplication entirely when target is unity (the common case) and apply a constant scalar otherwise. Range -60..=+6 dB; -60 is the floor (~0.001×), +6 is headroom that can clip on already-hot material. Applied **post**-metronome so the slider behaves like a true output fader and the metronome's own `volume_db` stays a relative trim. **Not persisted** in sessions — resets to 0 dB on every app launch (a per-track loudness offset is a separate problem; lumping it into the per-track autosession would tie the master slider to whichever track loaded last, which is the wrong mental model for "output fader"). Considered and rejected: applying pre-metronome (decouples the master from the click); a linear-percent or 0..2× scale (dB matches musician intuition and the existing metronome slider); per-track persistence (see above); a soft-knee limiter on the +6 dB top end (skip until clipping is shown to bite real material).
 - **Lenient session loading at the boundary** (decided v0.1 step 7). Saved sessions are validated only where the data could actually be wrong: the loop region is clamped to `[0, track_frame_count)` and dropped if degenerate (`start ≥ end` after clamping); `last_position` is clamped to track length; speed and pitch are passed through to the engine, which clamps them itself. The `version` field is checked strictly — any value other than `Session::CURRENT_VERSION = 1` errors out. A missing track file surfaces through the existing decode-failure path (`LoadStatus::Failed`) and clears the pending restore. JSON parse errors and write failures bubble up to a `session_error` line in the UI.
 

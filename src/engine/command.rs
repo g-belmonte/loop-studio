@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::dsp::DspKind;
+use crate::dsp::eq::EqSettings;
 use crate::engine::metronome::MetronomeSettings;
 use crate::track::{LoopRegion, Track};
 
@@ -32,4 +33,9 @@ pub enum Command {
     /// fast slider drags don't zipper. Not persisted in sessions — resets to
     /// 0 dB on every app launch.
     SetMasterVolume(f32),
+    /// Replace the EQ state in one shot. Like SetMetronome, the UI sends the
+    /// full settings struct on every relevant change rather than splitting
+    /// into per-field commands. Applied between DSP and metronome on the
+    /// worker; coefficient smoothing across the chunk is handled inside `Eq`.
+    SetEq(EqSettings),
 }
