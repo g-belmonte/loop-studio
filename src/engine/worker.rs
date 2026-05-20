@@ -30,6 +30,11 @@ pub fn run(rx: Receiver<Command>, state: Arc<SharedState>) {
     let mut current_channels: Option<u16> = None;
     let mut current_kind: DspKind = DspKind::default();
     let mut metronome = Metronome::new();
+    // Master output gain (linear). `current` tracks what the last chunk ended
+    // at; `target` is what the UI most recently requested. produce() ramps
+    // current → target linearly across one chunk to avoid zipper noise.
+    let mut master_current_gain: f32 = 1.0;
+    let mut master_target_gain: f32 = 1.0;
     let mut scratch: Vec<f32> = Vec::new();
     // Stitching buffer for chunks that straddle a loop boundary. Lazily sized
     // on first wrap; cost is one allocation per playback session.
@@ -47,6 +52,7 @@ pub fn run(rx: Receiver<Command>, state: Arc<SharedState>) {
             &mut current_channels,
             &mut current_kind,
             &mut metronome,
+            &mut master_target_gain,
             &mut scratch,
             &state,
         );
@@ -64,6 +70,8 @@ pub fn run(rx: Receiver<Command>, state: Arc<SharedState>) {
                 out,
                 &mut *dsp,
                 &mut metronome,
+                &mut master_current_gain,
+                master_target_gain,
                 &mut scratch,
                 &mut stitch_buf,
                 &state,
@@ -91,6 +99,7 @@ fn drain_commands(
     current_channels: &mut Option<u16>,
     current_kind: &mut DspKind,
     metronome: &mut Metronome,
+    master_target_gain: &mut f32,
     scratch: &mut Vec<f32>,
     state: &SharedState,
 ) -> bool {
@@ -107,6 +116,7 @@ fn drain_commands(
                 current_channels,
                 current_kind,
                 metronome,
+                master_target_gain,
                 scratch,
                 state,
             ),
@@ -128,6 +138,7 @@ fn apply(
     current_channels: &mut Option<u16>,
     current_kind: &mut DspKind,
     metronome: &mut Metronome,
+    master_target_gain: &mut f32,
     scratch: &mut Vec<f32>,
     state: &SharedState,
 ) {
@@ -254,6 +265,18 @@ fn apply(
         Command::SetMetronome(settings) => {
             metronome.set_settings(settings);
         }
+        Command::SetMasterVolume(db) => {
+            // Clamp + convert to linear here so produce() never has to think
+            // about dB. Floor at -60 dB (~0.001×) since the slider stops there;
+            // a non-finite input falls back to unity rather than poisoning the
+            // ramp with NaN.
+            let g = if db.is_finite() {
+                10f32.powf(db.max(-60.0) / 20.0)
+            } else {
+                1.0
+            };
+            *master_target_gain = g;
+        }
     }
 }
 
@@ -268,6 +291,8 @@ fn produce(
     output: &mut ActiveOutput,
     dsp: &mut dyn TimePitchProcessor,
     metronome: &mut Metronome,
+    master_current_gain: &mut f32,
+    master_target_gain: f32,
     scratch: &mut Vec<f32>,
     stitch_buf: &mut Vec<f32>,
     state: &SharedState,
@@ -395,6 +420,8 @@ fn produce(
         metronome.mix_segment(out_slice, channels, cursor_before, in_chunk as u64);
     }
 
+    apply_master_gain(out_slice, channels, master_current_gain, master_target_gain);
+
     output.producer.push_slice(out_slice);
 
     *cursor = new_cursor;
@@ -451,6 +478,39 @@ fn make_dsp(
             }
         },
     }
+}
+
+/// Apply the master output gain in place. When current and target match (the
+/// steady state once the slider settles) we skip the multiplication entirely
+/// at unity, or apply a constant scalar otherwise; when they differ we
+/// linearly ramp current → target across the segment to mask zipper noise on
+/// fast slider drags. `current` is updated to `target` on exit so the next
+/// chunk starts where this one ended.
+fn apply_master_gain(out: &mut [f32], channels: usize, current: &mut f32, target: f32) {
+    let frames = out.len() / channels;
+    if frames == 0 {
+        return;
+    }
+    let same = (*current - target).abs() < 1e-7;
+    if same {
+        if (target - 1.0).abs() < 1e-7 {
+            return;
+        }
+        for s in out.iter_mut() {
+            *s *= target;
+        }
+        return;
+    }
+    let step = (target - *current) / frames as f32;
+    let mut g = *current;
+    for f in 0..frames {
+        let base = f * channels;
+        for s in &mut out[base..base + channels] {
+            *s *= g;
+        }
+        g += step;
+    }
+    *current = target;
 }
 
 /// Snap a cursor frame into a loop region. Cursors below `start` or at/past

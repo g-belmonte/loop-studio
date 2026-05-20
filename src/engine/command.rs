@@ -27,4 +27,9 @@ pub enum Command {
     /// sends it on every relevant control change rather than splitting into
     /// per-field commands.
     SetMetronome(MetronomeSettings),
+    /// Master output gain in dB. Applied post-DSP and post-metronome as the
+    /// engine's final stage, with a per-chunk linear ramp to the new target so
+    /// fast slider drags don't zipper. Not persisted in sessions — resets to
+    /// 0 dB on every app launch.
+    SetMasterVolume(f32),
 }

@@ -22,6 +22,7 @@ pub fn show(
     dsp_kind: &mut DspKind,
     pitch_coarse: &mut i32,
     pitch_cents: &mut i32,
+    master_volume_db: &mut f32,
     sample_rate: u32,
     total_frames: u64,
 ) -> bool {
@@ -58,6 +59,25 @@ pub fn show(
     if response.changed() {
         engine.send(Command::Seek(pos));
     }
+
+    // Master output volume in dB. -60 floor (slightly below audible at unity
+    // headroom) up to +6 dB headroom; the slider is linear in dB-space because
+    // dB is already a log scale. Per-sample ramping lives in the worker, so
+    // we just fire SetMasterVolume on change and let the engine smooth it.
+    ui.horizontal(|ui| {
+        let r = ui.add(
+            egui::Slider::new(master_volume_db, -60.0..=6.0)
+                .suffix(" dB")
+                .text("master"),
+        );
+        if r.changed() {
+            engine.send(Command::SetMasterVolume(*master_volume_db));
+        }
+        if ui.button("0 dB").clicked() {
+            *master_volume_db = 0.0;
+            engine.send(Command::SetMasterVolume(0.0));
+        }
+    });
 
     // Speed control. Logarithmic so 0.5× and 2× sit equidistant from 1×.
     let mut speed = f32::from_bits(state.speed_bits.load(Ordering::Relaxed));

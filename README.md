@@ -60,6 +60,7 @@ See [ARCHITECTURE.md](./ARCHITECTURE.md#decisions) for the design notes behind e
 - [ ] **Speed ramping**: gradually increase loop speed each pass.
 - [ ] **EQ / band isolation** (focus on bass or vocal range).
 - [x] **Click track / metronome** synced to a tap-set tempo (source-frame anchored at the loop start, optional accent + beats/measure, BPM via tap / `T` key / number entry, mixed post-DSP into the engine output).
+- [x] **Master volume** slider (dB, -60 → +6, applied post-metronome with a per-chunk linear ramp; not persisted in sessions).
 - [ ] Export looped section as audio.
 
 ### Later

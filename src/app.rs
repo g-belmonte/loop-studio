@@ -84,6 +84,9 @@ pub struct App {
     /// across the "0 st" / "0 ct" reset buttons.
     pitch_coarse: i32,
     pitch_cents: i32,
+    /// Master output gain in dB (UI source of truth). Default 0 dB (unity).
+    /// Not persisted in sessions — resets on every app launch.
+    master_volume_db: f32,
     /// Metronome settings (UI source of truth — engine sees a copy via
     /// `Command::SetMetronome` on every change). Persisted in sessions.
     metronome: MetronomeSettings,
@@ -127,6 +130,7 @@ impl App {
             markers: Vec::new(),
             pitch_coarse: 0,
             pitch_cents: 0,
+            master_volume_db: 0.0,
             metronome: MetronomeSettings::default(),
             tap_tempo: TapTempo::new(),
             view: WaveformView::full(0),
@@ -586,6 +590,7 @@ impl eframe::App for App {
                             &mut self.dsp_kind,
                             &mut self.pitch_coarse,
                             &mut self.pitch_cents,
+                            &mut self.master_volume_db,
                             track.sample_rate,
                             track.frame_count(),
                         );
